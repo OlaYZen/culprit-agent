@@ -293,11 +293,15 @@ class EventCollector:
             sid = str(session.get("session"))
             open_ids.add(sid)
             props = linux.run(["loginctl", "show-session", sid,
-                               "-p", "Type", "-p", "Remote", "-p", "RemoteHost",
-                               "-p", "TTY", "-p", "LockedHint", "-p", "IdleHint"],
+                               "-p", "Type", "-p", "Class", "-p", "Service",
+                               "-p", "Remote", "-p", "RemoteHost", "-p", "TTY",
+                               "-p", "State", "-p", "LockedHint", "-p", "IdleHint"],
                               timeout=5)
             fields = dict(line.partition("=")[::2] for line in
                           (props or "").splitlines())
+            # list-sessions carries the login name; keep it beside the props so
+            # a current row can name *who* is on (and, via Service, that it's SSH).
+            fields["_user"] = session.get("user") or fields.get("Name") or None
             locked_hints[sid] = fields
 
         note = None
@@ -378,9 +382,15 @@ class EventCollector:
             "requires_elevation": not readable,
             "current": [
                 {"id": sid,
+                 "user": fields.get("_user"),
                  "type": fields.get("Type"),
+                 "class": fields.get("Class") or None,
+                 # The PAM service that opened it -- "sshd" is the SSH marker.
+                 "service": fields.get("Service") or None,
+                 "remote": fields.get("Remote") == "yes",
                  "tty": fields.get("TTY") or None,
                  "remote_host": fields.get("RemoteHost") or None,
+                 "state": fields.get("State") or None,
                  "locked": fields.get("LockedHint") == "yes",
                  "idle": fields.get("IdleHint") == "yes"}
                 for sid, fields in locked_hints.items()
