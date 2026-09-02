@@ -331,9 +331,14 @@ class Sampler:
         volumes = self.volumes.sample()
         services = self.services.sample()
         net_detail = self.net_detail.sample()
-        # The port map reuses the unit's pid->unit map so a row can name the
-        # systemd service behind a listener, not just its process.
-        ports = self.ports.sample(service_map=(services or {}).get("by_pid"))
+        # The port map names the systemd unit behind each listener from the
+        # process's own cgroup; the services list turns that unit name into its
+        # human description (the blue tag). Both are best-effort and degrade.
+        _svc_list = (services or {}).get("services") or []
+        _unit_desc = {s["name"]: (s.get("display_name") or s["name"])
+                      for s in _svc_list if s.get("name")}
+        ports = self.ports.sample(service_map=(services or {}).get("by_pid"),
+                                  unit_desc=_unit_desc)
         sync = self.sync.sample()
         system = sysinfo_mod.collect()  # cheap; refreshes uptime
 

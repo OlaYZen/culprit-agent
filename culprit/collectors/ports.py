@@ -52,8 +52,10 @@ def _is_loopback(ip: str) -> bool:
 class PortsCollector:
     """Slow-tick listening-port map with kill-ready process attribution."""
 
-    def sample(self, service_map: dict[str, list] | None = None) -> dict[str, object]:
+    def sample(self, service_map: dict[str, list] | None = None,
+               unit_desc: dict[str, str] | None = None) -> dict[str, object]:
         service_map = service_map or {}
+        unit_desc = unit_desc or {}
         try:
             conns = psutil.net_connections(kind="inet")
         except (psutil.AccessDenied, PermissionError) as exc:
@@ -107,7 +109,7 @@ class PortsCollector:
 
         def identify(pid: int) -> dict[str, object]:
             if pid not in identities:
-                identities[pid] = _identity(pid, service_map)
+                identities[pid] = _identity(pid, service_map, unit_desc)
             return identities[pid]
 
         ports_out: list[dict[str, object]] = []
@@ -161,7 +163,37 @@ class PortsCollector:
         }
 
 
-def _identity(pid: int, service_map: dict[str, list]) -> dict[str, object]:
+# systemd unit suffixes worth naming on a port. Ordered by preference: a
+# process's own .service/.socket is the useful attribution; .scope/.slice are
+# grouping.
+_UNIT_SUFFIXES = (".service", ".socket", ".scope", ".mount", ".target")
+
+
+def _unit_from_cgroup(pid: int) -> str | None:
+    """The systemd unit owning a process, read from its own /proc/<pid>/cgroup.
+
+    This is the reliable source and needs no systemctl / D-Bus, so it works
+    where the services collector cannot reach the bus (notably an agent in a
+    container). cgroup v2 is a single "0::<path>" line; the container view can
+    prefix it with '..' (e.g. "0::/../ssh.service"), which we skip. We return the
+    deepest real unit, preferring a .service/.socket over a wrapping .scope.
+    """
+    text = linux.read_text(f"/proc/{pid}/cgroup")
+    if not text:
+        return None
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        path = parts[2] if len(parts) == 3 else line
+        segments = [s for s in path.strip("/").split("/") if s and s != ".."]
+        for suffix in _UNIT_SUFFIXES:
+            for seg in reversed(segments):
+                if seg.endswith(suffix):
+                    return seg
+    return None
+
+
+def _identity(pid: int, service_map: dict[str, list],
+              unit_desc: dict[str, str]) -> dict[str, object]:
     """Name, command line, owner and hosting unit for one listening PID.
 
     Read straight from /proc (comm/cmdline/status) rather than through psutil --
@@ -186,6 +218,15 @@ def _identity(pid: int, service_map: dict[str, list]) -> dict[str, object]:
         except (KeyError, ValueError):
             username = uid_row[0] or None
 
+    # Prefer the unit from the process's own cgroup (reliable, no systemctl);
+    # describe it via the services map when available, else show the unit name.
+    # Fall back to the MainPID map for a process whose cgroup names no unit.
+    unit = _unit_from_cgroup(pid)
+    if unit:
+        units = [unit_desc.get(unit) or unit]
+    else:
+        units = (service_map.get(str(pid)) or [])[:4]
+
     can_kill, kill_reason = proc_mod.can_act(pid, "end")
     return {
         "pid": pid,
@@ -193,7 +234,7 @@ def _identity(pid: int, service_map: dict[str, list]) -> dict[str, object]:
         "exe": exe,
         "cmdline": cmdline or None,
         "username": username,
-        "units": (service_map.get(str(pid)) or [])[:4],
+        "units": units,
         "can_kill": can_kill,
         "kill_reason": kill_reason,
         "is_self": pid == os.getpid(),

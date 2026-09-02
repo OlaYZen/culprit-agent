@@ -59,6 +59,8 @@ docker run -d --name culprit-agent --restart unless-stopped \
   -v /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro \
   -v /var/log/journal:/var/log/journal:ro \
   -v /etc/machine-id:/etc/machine-id:ro \
+  -v /run/systemd:/run/systemd:ro \
+  -v /run/dbus:/run/dbus:ro \
   ghcr.io/olayzen/culprit-agent:latest
 ```
 
@@ -76,20 +78,24 @@ secret / mounted file).
 | `--pid host` | sees the host's processes (and their per-process CPU/IO/FDs) |
 | `--cap-add SYS_PTRACE` | reads other users' `/proc/<pid>/io`, fd counts, open files |
 | `--security-opt apparmor=unconfined` | attributes listening **ports** to their process — the default AppArmor profile blocks the `/proc/<pid>/fd` scan, so without it the Ports view shows every port as "another user's process". A no-op on hosts without AppArmor |
-| `-v /var/log/journal + /etc/machine-id` | the **journal** — `journalctl` reads it from files, so the Events and Sessions views work. Persistent journal assumed; on a volatile-only host mount `/run/log/journal` instead |
+| `-v /var/log/journal + /etc/machine-id` | the **journal** (Events view) — `journalctl` reads it from files, no daemon needed. Persistent journal assumed; on a volatile-only host mount `/run/log/journal` instead |
+| `-v /run/systemd + /run/dbus` | the **Services (systemd units)** view, the unit **descriptions** on Ports, and login **Sessions** — `systemctl`/`loginctl` reach the host's systemd + D-Bus over these sockets |
 | `-v /etc/os-release` | the host's OS identity (else the image's Debian base) — also gates Ubuntu Pro |
 | `-v /var/lib/ubuntu-advantage` | the Ubuntu Pro status row |
 
-With all of the above, CPU, memory, PSI, disk, network, **sockets/ports**,
-processes, **journal events/sessions**, OS identity and Ubuntu Pro all work. The
-one thing a container still cannot do is talk to the host's **systemd daemon**,
-so the **Services (systemd units)** view stays *unavailable* — everything
-degrades honestly rather than breaking. For that view, run the agent natively.
-Sources that need the host's **systemd** — systemd units and the journal (so the
-Services and Events views) — read as *unavailable* in a container unless you
-also mount `/run/systemd` and `/var/log/journal` and add `systemctl`/`journalctl`
-to the image; everything degrades honestly rather than breaking. For full
-coverage of those, run the agent natively (`agent.sh` above) instead.
+With all of the above, everything works: CPU, memory, PSI, disk, network,
+**ports** (with the systemd unit behind each), processes, journal events,
+sessions, systemd units, OS identity and Ubuntu Pro.
+
+Two honest caveats. The **Ports** view names each listener's systemd unit from
+the process's own cgroup, so the unit **name** shows even without the
+`/run/systemd` mount (the mount adds the friendlier **description**). And
+systemd-over-a-socket from inside a container can be **intermittent** — a
+Services tick may occasionally read "unavailable" and recover on the next one;
+the UI says so rather than pretending. Some managed platforms (e.g. TrueNAS
+SCALE apps) don't let you set `--pid host` / `--security-opt` / these mounts —
+there the agent runs with whatever it's given and degrades the rest. For the
+fullest picture, run the agent natively (`agent.sh`).
 
 To build the image yourself: `docker build -t culprit-agent .`
 
