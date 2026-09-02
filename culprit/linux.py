@@ -187,6 +187,41 @@ def cgroup_stats(path: Path) -> dict[str, object]:
     return out
 
 
+_UNIT_SUFFIXES = (".service", ".socket", ".scope", ".mount", ".target")
+
+
+def cgroup_path_of(pid: int) -> str | None:
+    """The cgroup v2 path of a PID (the '0::<path>' line of /proc/<pid>/cgroup).
+    In a container this can be namespace-relative, e.g. '/../ssh.service'."""
+    text = read_text(f"/proc/{pid}/cgroup")
+    if not text:
+        return None
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0":
+            return parts[2]
+    return None
+
+
+def unit_from_cgroup(pid: int) -> str | None:
+    """The systemd unit owning a PID, read from its own cgroup path.
+
+    Needs no systemctl / D-Bus, so it works where the bus is unreachable (an
+    agent in a container). Returns the deepest .service/.socket/.scope,
+    preferring a real unit over a wrapping .slice; namespace-relative '..'
+    segments are skipped.
+    """
+    path = cgroup_path_of(pid)
+    if not path:
+        return None
+    segments = [s for s in path.strip("/").split("/") if s and s != ".."]
+    for suffix in _UNIT_SUFFIXES:
+        for seg in reversed(segments):
+            if seg.endswith(suffix):
+                return seg
+    return None
+
+
 @lru_cache(maxsize=1)
 def in_container() -> str | None:
     """Container name ('docker', 'lxc', ...) or None on bare metal / full VM.
