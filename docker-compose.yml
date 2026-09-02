@@ -21,16 +21,25 @@ services:
     cap_add:
       - SYS_PTRACE
 
+    # AppArmor's default docker profile blocks the bulk /proc/<pid>/fd scan that
+    # attributes listening ports to processes — with it on, the Ports view lists
+    # ports but every one is "another user's process". Lifting the profile (a
+    # no-op on hosts without AppArmor) plus SYS_PTRACE gives full attribution.
+    security_opt:
+      - apparmor:unconfined
+
     # CULPRIT_HOST, CULPRIT_TOKEN and the optional CULPRIT_* vars come from here.
     env_file:
       - .env
 
     volumes:
-      # Without these two the OS identity is the container's Debian base, not the
-      # host: os-release gives the host distro + gates Ubuntu Pro; the second is
-      # the Ubuntu Pro status file.
+      # OS identity + Ubuntu Pro reflect the host, not the image's Debian base.
       - /etc/os-release:/etc/os-release:ro
       - /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro
-      # Optional extras — each unlocks one more source, all degrade gracefully:
-      # - /var/log/journal:/var/log/journal:ro   # journald events (also needs journalctl in the image)
-      # - /run/systemd:/run/systemd:ro           # systemd units (also needs systemctl in the image)
+      # journald events (Events / Sessions views): journalctl reads these files
+      # directly, no daemon needed. This assumes a persistent journal; on a
+      # volatile-only host mount /run/log/journal:ro instead of /var/log/journal.
+      - /var/log/journal:/var/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      # systemd *units* (Services view) additionally need the running systemd,
+      # which a container does not have — that source stays "unavailable".

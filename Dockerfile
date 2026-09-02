@@ -7,10 +7,11 @@
 # discipline is what makes a container deployment safe.
 FROM python:3.12-slim
 
-# iproute2 gives the agent `ip` for adapter/route detail. Everything else it
-# needs is psutil + the standard library.
+# iproute2 gives `ip` for adapter/route detail; systemd provides `journalctl`,
+# which reads the host journal from files (no daemon needed) when /var/log/journal
+# and /etc/machine-id are mounted. Everything else is psutil + the stdlib.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends iproute2 \
+ && apt-get install -y --no-install-recommends iproute2 systemd \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

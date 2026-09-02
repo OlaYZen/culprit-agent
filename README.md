@@ -53,9 +53,12 @@ Or run the image directly with the same file:
 ```bash
 docker run -d --name culprit-agent --restart unless-stopped \
   --network host --pid host --cap-add SYS_PTRACE \
+  --security-opt apparmor=unconfined \
   --env-file .env \
   -v /etc/os-release:/etc/os-release:ro \
   -v /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro \
+  -v /var/log/journal:/var/log/journal:ro \
+  -v /etc/machine-id:/etc/machine-id:ro \
   ghcr.io/olayzen/culprit-agent:latest
 ```
 
@@ -65,21 +68,23 @@ agent's CLI): `CULPRIT_HOST` and `CULPRIT_TOKEN` are required; `CULPRIT_INTERVAL
 optional. The token may also be supplied via `CULPRIT_TOKEN_FILE` (a Docker
 secret / mounted file).
 
-**Why the host flags:**
+**Why the flags and mounts:**
 
-| Flag | Unlocks |
+| Flag / mount | Unlocks |
 |---|---|
 | `--network host` | reaches the host node, and sees the host's interfaces and sockets |
 | `--pid host` | sees the host's processes (and their per-process CPU/IO/FDs) |
 | `--cap-add SYS_PTRACE` | reads other users' `/proc/<pid>/io`, fd counts, open files |
-| `-v /etc/os-release:…:ro` | the host's OS identity (else you see the image's Debian base) — this also gates Ubuntu Pro |
-| `-v /var/lib/ubuntu-advantage:…:ro` | the Ubuntu Pro status row |
+| `--security-opt apparmor=unconfined` | attributes listening **ports** to their process — the default AppArmor profile blocks the `/proc/<pid>/fd` scan, so without it the Ports view shows every port as "another user's process". A no-op on hosts without AppArmor |
+| `-v /var/log/journal + /etc/machine-id` | the **journal** — `journalctl` reads it from files, so the Events and Sessions views work. Persistent journal assumed; on a volatile-only host mount `/run/log/journal` instead |
+| `-v /etc/os-release` | the host's OS identity (else the image's Debian base) — also gates Ubuntu Pro |
+| `-v /var/lib/ubuntu-advantage` | the Ubuntu Pro status row |
 
-CPU, memory, PSI, disk, network, sockets and the process table work out of the
-box (Docker already exposes the host's `/proc/stat`, `/proc/meminfo`, etc.).
-**Userspace files come from the image, not the host** — mount `/etc/os-release`
-(above) so the machine shows the host distro and its Ubuntu Pro status rather
-than the container's Debian base.
+With all of the above, CPU, memory, PSI, disk, network, **sockets/ports**,
+processes, **journal events/sessions**, OS identity and Ubuntu Pro all work. The
+one thing a container still cannot do is talk to the host's **systemd daemon**,
+so the **Services (systemd units)** view stays *unavailable* — everything
+degrades honestly rather than breaking. For that view, run the agent natively.
 Sources that need the host's **systemd** — systemd units and the journal (so the
 Services and Events views) — read as *unavailable* in a container unless you
 also mount `/run/systemd` and `/var/log/journal` and add `systemctl`/`journalctl`
