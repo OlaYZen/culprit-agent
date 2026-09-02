@@ -21,6 +21,7 @@ everything they are not obliged to answer.
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import socket
 import time
@@ -83,10 +84,25 @@ def _vpn_type(name: str) -> str:
 
 # HTTP (not HTTPS) on purpose: the response is a single public IP, not a secret,
 # and plain HTTP sidesteps CA-trust differences across minimal container images.
+# ip-api additionally names the IP's owner and flags known proxy/VPN exits,
+# which is how an upstream (router-level) VPN with no local interface is caught.
+_WAN_INFO_URL = ("http://ip-api.com/json/?fields=status,query,isp,org,as,"
+                 "proxy,hosting")
 _WAN_ENDPOINTS = (
     "http://checkip.amazonaws.com",
     "http://ifconfig.me/ip",
     "http://icanhazip.com",
+)
+
+# Substrings that mark a WAN exit IP as a VPN provider's, from the IP's org/ISP/
+# ASN. A plain datacenter IP is "hosting" but NOT a VPN, so the hosting flag is
+# deliberately never used as a signal on its own -- only proxy or a name match.
+_VPN_PROVIDER_HINTS = (
+    "mullvad", "31173 services", "nordvpn", "nord vpn", "protonvpn",
+    "proton vpn", "proton ag", "expressvpn", "express vpn", "surfshark",
+    "private internet access", "cyberghost", "ipvanish", "windscribe",
+    "tunnelbear", "azirevpn", "perfect privacy", "torguard", "vyprvpn",
+    "purevpn", "hide.me", "ovpn ", "mullvad vpn", "datapacket",
 )
 
 
@@ -98,14 +114,37 @@ def _looks_like_ip(text: str) -> bool:
         return False
 
 
+def _vpn_provider(*fields: object) -> str | None:
+    """The VPN provider named in an IP's org/ISP/ASN, or None."""
+    blob = " ".join(str(f).lower() for f in fields if f)
+    return next((hint for hint in _VPN_PROVIDER_HINTS if hint in blob), None)
+
+
 def _wan_ip() -> dict[str, object]:
-    """The machine's public (WAN) IP, via a small outbound echo request.
+    """The machine's public (WAN) IP, and -- where the lookup allows -- who owns
+    it, so an upstream VPN can be recognised from its exit address.
 
     This is the one collector that deliberately reaches a third party, so it is
     cached hard by the caller (the IP changes rarely) and every failure degrades
-    to an explicit unavailable+reason rather than a blank or a guess. On a
-    full-tunnel VPN this is the VPN's exit IP -- which is exactly the point.
+    to an explicit unavailable+reason rather than a blank or a guess. Primary
+    source ip-api.com returns the IP together with its ISP/org/ASN and a proxy
+    flag in one request; a plain echo service is the IP-only fallback.
     """
+    try:
+        req = urllib.request.Request(_WAN_INFO_URL,
+                                     headers={"User-Agent": "curl/8"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read(4096).decode("utf-8", "replace"))
+        ip = str(data.get("query") or "")
+        if data.get("status") == "success" and _looks_like_ip(ip):
+            return {"available": True, "ip": ip, "via": "ip-api.com",
+                    "isp": data.get("isp") or None, "org": data.get("org") or None,
+                    "asn": data.get("as") or None,
+                    "proxy": bool(data.get("proxy")),
+                    "hosting": bool(data.get("hosting")), "reason": None}
+    except Exception:  # noqa: BLE001 -- fall through to the echo services
+        pass
+
     for url in _WAN_ENDPOINTS:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
@@ -116,10 +155,13 @@ def _wan_ip() -> dict[str, object]:
         ip = text.split()[0] if text else ""
         if _looks_like_ip(ip):
             host = url.split("//", 1)[-1].split("/", 1)[0]
-            return {"available": True, "ip": ip, "via": host, "reason": None}
-    return {"available": False, "ip": None, "via": None,
-            "reason": "no public-IP echo service answered (no outbound internet, "
-                      "or HTTP egress is blocked)"}
+            return {"available": True, "ip": ip, "via": host, "isp": None,
+                    "org": None, "asn": None, "proxy": None, "hosting": None,
+                    "reason": None}
+    return {"available": False, "ip": None, "via": None, "isp": None,
+            "org": None, "asn": None, "proxy": None, "hosting": None,
+            "reason": "no public-IP service answered (no outbound internet, or "
+                      "HTTP egress is blocked)"}
 
 
 class NetworkRateCollector:
@@ -244,16 +286,30 @@ class NetworkDetailCollector:
             if adapter.get("kind") == "vpn" and adapter.get("ip_addresses")
         ]
 
+        # Second signal: the exit IP itself. An upstream/router VPN leaves no
+        # local interface, so it is only visible as a WAN IP owned by a VPN
+        # provider (name match) or flagged as a proxy/VPN exit. "hosting" alone
+        # is never used -- a plain VPS is hosting but not a VPN.
+        wan = self._wan or {}
+        provider = _vpn_provider(wan.get("org"), wan.get("isp"), wan.get("asn"))
+        via_exit_ip = bool(wan.get("proxy")) or provider is not None
+        exit_provider = (wan.get("org") or wan.get("isp")) if via_exit_ip else None
+
         return {
             "adapters": self._config or [],
             "sockets": sockets,
             "connectivity": self._probe_cache,
             "wan_ip": self._wan,
             "vpn": {
-                "active": bool(vpn_active),
-                # A VPN interface that carries the default route means all
-                # traffic exits through it (full tunnel), not just a subnet.
-                "full_tunnel": any(a.get("default_route") for a in vpn_active),
+                "active": bool(vpn_active) or via_exit_ip,
+                # A VPN interface carrying the default route -- or an exit IP that
+                # is itself the VPN's -- means all traffic leaves via the VPN.
+                "full_tunnel": (any(a.get("default_route") for a in vpn_active)
+                                or via_exit_ip),
+                # Detected purely from the exit IP (no local VPN interface) --
+                # i.e. the VPN runs upstream, on the router.
+                "via_exit_ip": via_exit_ip,
+                "exit_provider": exit_provider,
                 "interfaces": [
                     {"name": a["description"],
                      "type": _vpn_type(str(a["description"])),
