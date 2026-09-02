@@ -20,9 +20,11 @@ everything they are not obliged to answer.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import socket
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import psutil
@@ -61,6 +63,63 @@ def _classify(name: str) -> str:
     if devtype == "wwan":
         return "cellular"
     return "other"
+
+
+# VPN interface name -> the software behind it, so the UI can say *which* VPN.
+_VPN_TYPES: tuple[tuple[str, str], ...] = (
+    ("nordlynx", "NordVPN"), ("proton", "ProtonVPN"), ("tailscale", "Tailscale"),
+    ("wg", "WireGuard"), ("zt", "ZeroTier"), ("tun", "OpenVPN"),
+    ("tap", "OpenVPN"), ("ppp", "PPP"),
+)
+
+
+def _vpn_type(name: str) -> str:
+    low = name.lower()
+    for prefix, label in _VPN_TYPES:
+        if low.startswith(prefix):
+            return label
+    return "VPN"
+
+
+# HTTP (not HTTPS) on purpose: the response is a single public IP, not a secret,
+# and plain HTTP sidesteps CA-trust differences across minimal container images.
+_WAN_ENDPOINTS = (
+    "http://checkip.amazonaws.com",
+    "http://ifconfig.me/ip",
+    "http://icanhazip.com",
+)
+
+
+def _looks_like_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def _wan_ip() -> dict[str, object]:
+    """The machine's public (WAN) IP, via a small outbound echo request.
+
+    This is the one collector that deliberately reaches a third party, so it is
+    cached hard by the caller (the IP changes rarely) and every failure degrades
+    to an explicit unavailable+reason rather than a blank or a guess. On a
+    full-tunnel VPN this is the VPN's exit IP -- which is exactly the point.
+    """
+    for url in _WAN_ENDPOINTS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                text = resp.read(64).decode("utf-8", "replace").strip()
+        except Exception:  # noqa: BLE001 -- any failure just tries the next host
+            continue
+        ip = text.split()[0] if text else ""
+        if _looks_like_ip(ip):
+            host = url.split("//", 1)[-1].split("/", 1)[0]
+            return {"available": True, "ip": ip, "via": host, "reason": None}
+    return {"available": False, "ip": None, "via": None,
+            "reason": "no public-IP echo service answered (no outbound internet, "
+                      "or HTTP egress is blocked)"}
 
 
 class NetworkRateCollector:
@@ -157,6 +216,8 @@ class NetworkDetailCollector:
         self._config_at = 0.0
         self._probe_cache: dict[str, object] = {}
         self._probe_at = 0.0
+        self._wan: dict[str, object] | None = None
+        self._wan_at = 0.0
 
     def sample(self) -> dict[str, object]:
         now = time.monotonic()
@@ -172,6 +233,12 @@ class NetworkDetailCollector:
             self._probe_cache = _connectivity(self._config or [])
             self._probe_at = now
 
+        # The public IP changes rarely and the lookup is an outbound request, so
+        # it refreshes far less often than the rest of the slow tier.
+        if self._wan is None or now - self._wan_at > 300:
+            self._wan = _wan_ip()
+            self._wan_at = now
+
         vpn_active = [
             adapter for adapter in (self._config or [])
             if adapter.get("kind") == "vpn" and adapter.get("ip_addresses")
@@ -181,8 +248,19 @@ class NetworkDetailCollector:
             "adapters": self._config or [],
             "sockets": sockets,
             "connectivity": self._probe_cache,
+            "wan_ip": self._wan,
             "vpn": {
                 "active": bool(vpn_active),
+                # A VPN interface that carries the default route means all
+                # traffic exits through it (full tunnel), not just a subnet.
+                "full_tunnel": any(a.get("default_route") for a in vpn_active),
+                "interfaces": [
+                    {"name": a["description"],
+                     "type": _vpn_type(str(a["description"])),
+                     "addresses": a.get("ip_addresses") or [],
+                     "default_route": bool(a.get("default_route"))}
+                    for a in vpn_active
+                ],
                 "adapters": [a["description"] for a in vpn_active],
             },
         }
@@ -198,10 +276,16 @@ def _adapter_config() -> list[dict[str, object]]:
     routes = linux.run_json(["ip", "-json", "route", "show", "default"],
                             timeout=5)
     gateway_by_dev: dict[str, list[str]] = {}
+    default_devs: set[str] = set()
     for route in routes if isinstance(routes, list) else []:
         dev = route.get("dev")
+        if not dev:
+            continue
+        # A full-tunnel VPN default route may have no gateway (point-to-point),
+        # so track the device separately from the gateway.
+        default_devs.add(dev)
         gw = route.get("gateway")
-        if dev and gw:
+        if gw:
             gateway_by_dev.setdefault(dev, []).append(str(gw))
 
     dns_servers, dns_domain, dns_source = _dns_config()
@@ -228,6 +312,7 @@ def _adapter_config() -> list[dict[str, object]]:
             "ip_addresses": ips,
             "subnets": subnets,
             "gateways": gateways,
+            "default_route": name in default_devs,
             # DNS on Linux is system-wide (resolved/resolv.conf), not
             # per-adapter; every row shows the same resolver set and its
             # provenance rather than pretending per-NIC DNS exists.
