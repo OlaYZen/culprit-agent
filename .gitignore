@@ -4,6 +4,10 @@
 # Agent credentials — host URL + bearer token, written by agent.sh. Never commit.
 agent.json
 
+# Docker env files hold the token — commit only .env.example.
+.env
+stack.env
+
 # The agent keeps no database, but never commit one if it appears
 *.db
 *.db-wal
