@@ -20,6 +20,12 @@ WORKDIR /app
 COPY requirements-agent.txt ./
 RUN pip install --no-cache-dir -r requirements-agent.txt
 
+# nvidia-ml-py (the `pynvml` module) lets the GPU collector's NVML backend read
+# an NVIDIA GPU's utilisation, VRAM and per-process memory. Pure Python, no
+# native deps; it only does anything when the container is run with `--gpus all`
+# (which injects the driver's libnvidia-ml). A harmless no-op otherwise.
+RUN pip install --no-cache-dir nvidia-ml-py
+
 COPY version.json ./
 COPY culprit/ ./culprit/
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

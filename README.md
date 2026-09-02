@@ -71,6 +71,36 @@ the optional `-e` vars below if you need them:
 To update later, re-run the exact same command: `--pull always` fetches the
 latest image and Docker recreates the container.
 
+### NVIDIA GPU
+
+To surface an NVIDIA GPU (utilisation, VRAM, per-process memory in the Graphics
+panel), add `--gpus all` and expose the driver's libraries — this needs the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+installed on the host:
+
+```bash
+docker run -d --name culprit-agent --restart unless-stopped --pull always \
+  --privileged --pid host --network host \
+  --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e CULPRIT_HOST=http://192.168.1.1:8787 \
+  -e CULPRIT_TOKEN=web-01.your-secret-here \
+  -v /etc/passwd:/etc/passwd:ro \
+  -v /etc/group:/etc/group:ro \
+  -v /etc/os-release:/etc/os-release:ro \
+  -v /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro \
+  -v /var/log/journal:/var/log/journal:ro \
+  -v /etc/machine-id:/etc/machine-id:ro \
+  -v /run/systemd:/run/systemd:ro \
+  -v /run/dbus:/run/dbus:ro \
+  ghcr.io/olayzen/culprit-agent:latest
+```
+
+The image already bundles `nvidia-ml-py`, so `--gpus all` is the only extra you
+need. Without it the Graphics panel reads "unavailable" and nothing else is
+affected. **Intel / AMD GPUs don't use `--gpus`** — they surface through
+`/dev/dri`, which `--privileged` already exposes (Intel shows only while a
+process is actively using the GPU, e.g. a live transcode).
+
 **Why the flags and mounts:**
 
 | Flag / mount | Unlocks |
