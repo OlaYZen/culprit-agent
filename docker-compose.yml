@@ -33,6 +33,11 @@ services:
       - .env
 
     volumes:
+      # Resolve host UIDs to real login names (the Debian base image's passwd
+      # lacks the host's system users, so owners would read "uid 101"). Also
+      # names the owner of any port/process the agent can't fully attribute.
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
       # OS identity + Ubuntu Pro reflect the host, not the image's Debian base.
       - /etc/os-release:/etc/os-release:ro
       - /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro
