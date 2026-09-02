@@ -38,23 +38,18 @@ you put it elsewhere.
 
 A prebuilt image is published to GitHub Container Registry on every push
 (GitHub Actions → `ghcr.io/olayzen/culprit-agent`). The agent monitors the
-**host** it runs on, so it needs the host's PID and network namespaces.
+**host** it runs on, so it runs **privileged** in the host's PID and network
+namespaces.
 
-Configuration lives in an env file — copy the template and set your host + token
-(on Portainer / TrueNAS SCALE, set the same variables as the stack's env):
-
-```bash
-cp .env.example .env      # then edit CULPRIT_HOST and CULPRIT_TOKEN
-docker compose up -d
-```
-
-Or run the image directly with the same file:
+Set your host URL and token, then run this — it is the whole installer:
 
 ```bash
-docker run -d --name culprit-agent --restart unless-stopped \
-  --network host --pid host --cap-add SYS_PTRACE \
-  --security-opt apparmor=unconfined \
-  --env-file .env \
+docker run -d --name culprit-agent --restart unless-stopped --pull always \
+  --privileged --pid host --network host \
+  -e CULPRIT_HOST=http://192.168.1.1:8787 \
+  -e CULPRIT_TOKEN=web-01.your-secret-here \
+  -v /etc/passwd:/etc/passwd:ro \
+  -v /etc/group:/etc/group:ro \
   -v /etc/os-release:/etc/os-release:ro \
   -v /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro \
   -v /var/log/journal:/var/log/journal:ro \
@@ -64,21 +59,26 @@ docker run -d --name culprit-agent --restart unless-stopped \
   ghcr.io/olayzen/culprit-agent:latest
 ```
 
-**Configuration is by environment variable** (the entrypoint turns them into the
-agent's CLI): `CULPRIT_HOST` and `CULPRIT_TOKEN` are required; `CULPRIT_INTERVAL`,
-`CULPRIT_INSECURE=1` (accept a self-signed host cert) and `CULPRIT_LOG_LEVEL` are
-optional. The token may also be supplied via `CULPRIT_TOKEN_FILE` (a Docker
-secret / mounted file).
+Only the two `CULPRIT_HOST` / `CULPRIT_TOKEN` values are required. Add any of
+the optional `-e` vars below if you need them:
+
+- `CULPRIT_HOST` **(required)** — your host dashboard URL, e.g. `http://192.168.1.1:8787`
+- `CULPRIT_TOKEN` **(required)** — get it from the dashboard → Nodes → *Generate token* (or `CULPRIT_TOKEN_FILE` to read it from a mounted file / Docker secret)
+- `CULPRIT_INTERVAL=1` — fast-tier sampling seconds (default `1`)
+- `CULPRIT_INSECURE=1` — accept a self-signed host cert (only for an `https://` host with an untrusted cert; irrelevant for plain HTTP)
+- `CULPRIT_LOG_LEVEL=info` — `debug` when troubleshooting
+
+To update later, re-run the exact same command: `--pull always` fetches the
+latest image and Docker recreates the container.
 
 **Why the flags and mounts:**
 
 | Flag / mount | Unlocks |
 |---|---|
+| `--privileged` | full host access — all capabilities (`SYS_PTRACE`, …) and no AppArmor/seccomp confinement, so listening **ports** attribute to their process and are killable. Without it the Ports view shows every port as "another user's process" |
+| `--pid host` | sees the host's processes (and their per-process CPU/IO/FDs) — **mandatory**, even privileged sees nothing without it |
 | `--network host` | reaches the host node, and sees the host's interfaces and sockets |
-| `--pid host` | sees the host's processes (and their per-process CPU/IO/FDs) |
-| `--cap-add SYS_PTRACE` | reads other users' `/proc/<pid>/io`, fd counts, open files |
-| `-v /etc/passwd + /etc/group` | *optional, off by default* — resolves host UIDs to real login names (else system users read as `uid 101`). Cosmetic only. **Portainer blocks stacks that mount `/etc/passwd` (a 403 on deploy)**, so add these two only when deploying from the CLI: `-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro` |
-| `--security-opt apparmor=unconfined` | attributes listening **ports** to their process — the default AppArmor profile blocks the `/proc/<pid>/fd` scan, so without it the Ports view shows every port as "another user's process". A no-op on hosts without AppArmor |
+| `-v /etc/passwd + /etc/group` | resolves host UIDs to real login names (else system users read as `uid 101`) |
 | `-v /var/log/journal + /etc/machine-id` | the **journal** (Events view) — `journalctl` reads it from files, no daemon needed. Persistent journal assumed; on a volatile-only host mount `/run/log/journal` instead |
 | `-v /run/systemd + /run/dbus` | the **Services (systemd units)** view, the unit **descriptions** on Ports, and login **Sessions** — `systemctl`/`loginctl` reach the host's systemd + D-Bus over these sockets |
 | `-v /etc/os-release` | the host's OS identity (else the image's Debian base) — also gates Ubuntu Pro |
@@ -95,26 +95,26 @@ systemd-over-a-socket from inside a container can be **intermittent** — a
 Services tick may occasionally read "unavailable", and the **Services** view
 then falls back to listing the running units read from each process's cgroup
 (no per-unit CPU/memory, no inactive units) rather than showing nothing.
-Likewise a listening **port** the agent can't map to a PID (no `SYS_PTRACE`, or
-a locked-down host) is still named by its **owner** from `/proc/net` — `root`,
-or `uid 101` for a host system user (a real name like `systemd-resolve` with the
-optional `/etc/passwd` mount above) — just not killable from the dashboard. Some managed
-platforms (e.g. TrueNAS SCALE apps) don't let you set `--pid host` /
-`--security-opt` / these mounts — there the agent runs with whatever it's given
-and degrades the rest. For the fullest picture, run the agent natively
-(`agent.sh`).
+Some managed platforms (e.g. TrueNAS SCALE apps) don't let you run privileged
+or set `--pid host` / these mounts — there the agent runs with whatever it's
+given and degrades the rest (an unattributable port still shows its **owner**
+from `/proc/net`, just not a kill button). For the fullest picture, run it with
+the command above, or natively (`agent.sh`) as root.
 
 To build the image yourself: `docker build -t culprit-agent .`
 
 ## What's inside
 
 ```
-agent.sh                 bootstrap venv + save config + run  (python -m culprit.agent)
-requirements-agent.txt   psutil — the only runtime dependency
-culprit-agent.service    systemd user unit
-sync-package.sh          maintainer tool: refresh culprit/ from the repo
-culprit/                 a copy of the runnable package (collectors, sampler,
-                         db, state, config, linux, util, agent)
+agent.sh                      bootstrap venv + save config + run (python -m culprit.agent)
+requirements-agent.txt        psutil — the only runtime dependency
+culprit-agent.service         systemd USER unit (unprivileged)
+culprit-agent.system.service  systemd SYSTEM unit — runs as root, full attribution
+Dockerfile                    builds the ghcr.io/olayzen/culprit-agent image
+docker/entrypoint.sh          maps the CULPRIT_* env vars onto the agent CLI
+sync-package.sh               maintainer tool: refresh culprit/ from the repo
+culprit/                      a copy of the runnable package (collectors, sampler,
+                              db, state, config, linux, util, agent)
 ```
 
 ## Keeping the package copy in sync (maintainers only)
