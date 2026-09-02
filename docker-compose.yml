@@ -1,0 +1,36 @@
+# Culprit report-only agent — monitors the HOST it runs on, opens no ports.
+#
+#   cp .env.example .env      # then set CULPRIT_HOST and CULPRIT_TOKEN in .env
+#   docker compose up -d
+#
+# Config comes from the .env file (see .env.example). To build the image locally
+# instead of pulling from GHCR, comment `image:` and uncomment `build: .`.
+services:
+  culprit-agent:
+    image: ghcr.io/olayzen/culprit-agent:latest
+    # build: .
+    container_name: culprit-agent
+    restart: unless-stopped
+
+    # Monitor the host, not the container: share its PID + network namespaces.
+    # (host network also lets the agent reach the host node and see host sockets.)
+    pid: host
+    network_mode: host
+
+    # Read other users' /proc/<pid>/io, fd counts and open files.
+    cap_add:
+      - SYS_PTRACE
+
+    # CULPRIT_HOST, CULPRIT_TOKEN and the optional CULPRIT_* vars come from here.
+    env_file:
+      - .env
+
+    volumes:
+      # Without these two the OS identity is the container's Debian base, not the
+      # host: os-release gives the host distro + gates Ubuntu Pro; the second is
+      # the Ubuntu Pro status file.
+      - /etc/os-release:/etc/os-release:ro
+      - /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro
+      # Optional extras — each unlocks one more source, all degrade gracefully:
+      # - /var/log/journal:/var/log/journal:ro   # journald events (also needs journalctl in the image)
+      # - /run/systemd:/run/systemd:ro           # systemd units (also needs systemctl in the image)
