@@ -36,10 +36,15 @@ services:
       # OS identity + Ubuntu Pro reflect the host, not the image's Debian base.
       - /etc/os-release:/etc/os-release:ro
       - /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro
-      # journald events (Events / Sessions views): journalctl reads these files
-      # directly, no daemon needed. This assumes a persistent journal; on a
-      # volatile-only host mount /run/log/journal:ro instead of /var/log/journal.
+      # journald events (Events view): journalctl reads these files directly, no
+      # daemon needed. Persistent journal assumed; on a volatile-only host mount
+      # /run/log/journal:ro instead of /var/log/journal.
       - /var/log/journal:/var/log/journal:ro
       - /etc/machine-id:/etc/machine-id:ro
-      # systemd *units* (Services view) additionally need the running systemd,
-      # which a container does not have — that source stays "unavailable".
+      # Systemd units (Services view), the unit *descriptions* on Ports, and
+      # login Sessions: hand the container the host's systemd + D-Bus sockets so
+      # systemctl/loginctl can reach the host bus. (Ports already show the unit
+      # *name* from each process's cgroup without these; systemd-over-a-socket
+      # from a container can be intermittent, and the UI says so when it is.)
+      - /run/systemd:/run/systemd:ro
+      - /run/dbus:/run/dbus:ro
