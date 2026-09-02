@@ -1,15 +1,30 @@
 #!/usr/bin/env bash
-# Refresh culprit-agent/culprit/ from the shared host package (../culprit), so
-# this self-contained bundle stays in sync after edits to shared code
-# (collectors, sampler, db, state, config, linux, util). Host-only modules
-# (main.py/auth.py/nodes.py) are never copied; the agent-only agent.py is
-# preserved. Run from anywhere.
+# Refresh this bundle's culprit/ from the host repo's package, so the
+# self-contained agent stays in sync after edits to shared code (collectors,
+# sampler, db, state, config, linux, util). Host-only modules
+# (main.py/auth.py/nodes.py/__main__.py) are never copied; the agent-only
+# agent.py is preserved.
+#
+# The host repo (github.com/OlaYZen/culprit) is expected as a SIBLING checkout,
+# so its package is ../culprit/culprit. Override with CULPRIT_SRC=/path/to/culprit
+# (the package dir) if it lives elsewhere. Run from anywhere.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-repo="$(dirname "$here")"
+src="${CULPRIT_SRC:-$here/../culprit/culprit}"
+
+# Guard against the classic footgun: pointing at the repo ROOT instead of the
+# package would rsync the whole host repo (web/, tools/, data/, .git) into
+# culprit/. A real package has collectors/ and sampler.py at its top.
+if [ ! -d "$src/collectors" ] || [ ! -f "$src/sampler.py" ]; then
+    echo "error: '$src' is not the culprit package (no collectors/ + sampler.py)." >&2
+    echo "       Clone github.com/OlaYZen/culprit next to this repo, or set" >&2
+    echo "       CULPRIT_SRC=/path/to/culprit/culprit" >&2
+    exit 1
+fi
+
 rsync -a --delete \
-  --exclude='main.py' --exclude='auth.py' --exclude='nodes.py' --exclude='__main__.py' \
-  --exclude='agent.py' \
+  --exclude='main.py' --exclude='auth.py' --exclude='nodes.py' \
+  --exclude='__main__.py' --exclude='agent.py' \
   --exclude='__pycache__' --exclude='*.pyc' \
-  "$repo/culprit/" "$here/culprit/"
-echo "synced $repo/culprit -> $here/culprit (agent.py preserved, host-only files skipped)"
+  "$src/" "$here/culprit/"
+echo "synced $src -> $here/culprit (agent.py preserved, host-only files skipped)"

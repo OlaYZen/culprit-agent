@@ -13,6 +13,7 @@ instead of the Windows-era "run as administrator".
 from __future__ import annotations
 
 import getpass
+import json
 import logging
 import os
 import socket
@@ -163,6 +164,87 @@ def _access_map() -> dict[str, object]:
     }
 
 
+_PRO_DIR = "/var/lib/ubuntu-advantage"
+_PRO_STATUS = f"{_PRO_DIR}/status.json"
+
+
+def _pro_expiry(raw: object) -> tuple[float | None, bool]:
+    """(epoch seconds, perpetual). A free personal token encodes 'no expiry'
+    as the year 9999, which we surface as perpetual rather than a silly date."""
+    if not raw:
+        return None, False
+    text = str(raw)
+    if text.startswith("9999"):
+        return None, True
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(
+            text.replace("Z", "+00:00")).timestamp(), False
+    except (ValueError, TypeError):
+        return None, False
+
+
+def _ubuntu_pro(release: dict[str, str]) -> dict[str, object] | None:
+    """Ubuntu Pro subscription state, or None on non-Ubuntu (so the UI omits it).
+
+    Read from the pro client's world-readable cache
+    (`/var/lib/ubuntu-advantage/status.json`), never `pro status` -- that
+    contacts contracts.canonical.com and measured ~5s here, unacceptable for a
+    background sampler. The cache is refreshed by the client's own timer; a
+    stale-but-instant read is the right trade. The account email is deliberately
+    not surfaced.
+    """
+    if (release.get("ID") or "").lower() != "ubuntu":
+        return None
+    if not os.path.exists(_PRO_DIR):
+        return {"available": False, "attached": False,
+                "reason": "Ubuntu Pro client (ubuntu-pro-client) is not installed"}
+    text = linux.read_text(_PRO_STATUS)
+    if text is None:
+        return {"available": False, "attached": False,
+                "reason": "pro status cache is absent or unreadable "
+                          "(/var/lib/ubuntu-advantage/status.json)"}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {"available": False, "attached": False,
+                "reason": "pro status cache is not valid JSON"}
+
+    attached = bool(data.get("attached"))
+    enabled: list[str] = []
+    services: list[dict[str, object]] = []
+    for svc in data.get("services") or []:
+        name = svc.get("name")
+        if not name:
+            continue
+        status = svc.get("status")            # enabled | disabled | n/a | ...
+        entitled = svc.get("entitled")        # yes | no
+        if status == "enabled":
+            enabled.append(name)
+        # Only the services worth showing: entitled here or currently on. The
+        # long tail of n/a-on-this-hardware entries is noise.
+        if entitled == "yes" or status == "enabled":
+            services.append({
+                "name": name,
+                "description": svc.get("description"),
+                "status": status,
+                "entitled": entitled,
+                "available": svc.get("available"),
+            })
+
+    expires_epoch, perpetual = _pro_expiry(data.get("expires"))
+    return {
+        "available": True,
+        "attached": attached,
+        "origin": data.get("origin"),         # "free" | "contract" | ...
+        "expires_epoch": expires_epoch,
+        "perpetual": perpetual,
+        "enabled": enabled,
+        "services": services,
+        "reason": None if attached else "this machine is not attached to Ubuntu Pro",
+    }
+
+
 _cache: dict[str, object] | None = None
 
 
@@ -220,6 +302,11 @@ def collect(force: bool = False) -> dict[str, object]:
         "utc_offset_minutes": -time.timezone // 60 if not time.daylight
                               else -time.altzone // 60,
     }
+    # Ubuntu Pro only exists on Ubuntu; the key is omitted entirely elsewhere so
+    # the dashboard never shows it on a non-Ubuntu machine.
+    pro = _ubuntu_pro(release)
+    if pro is not None:
+        payload["ubuntu_pro"] = pro
     _cache = payload
     return payload
 
