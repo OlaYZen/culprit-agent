@@ -33,11 +33,13 @@ services:
       - .env
 
     volumes:
-      # Resolve host UIDs to real login names (the Debian base image's passwd
-      # lacks the host's system users, so owners would read "uid 101"). Also
-      # names the owner of any port/process the agent can't fully attribute.
-      - /etc/passwd:/etc/passwd:ro
-      - /etc/group:/etc/group:ro
+      # OPTIONAL — resolve host UIDs to real login names (else system users show
+      # as "uid 101" instead of "systemd-resolve"). Purely cosmetic; everything
+      # works without them. Left commented because Portainer's security policy
+      # refuses to deploy a stack that bind-mounts /etc/passwd (a 403 on update).
+      # Uncomment only if you deploy from the CLI / a Portainer that allows it.
+      # - /etc/passwd:/etc/passwd:ro
+      # - /etc/group:/etc/group:ro
       # OS identity + Ubuntu Pro reflect the host, not the image's Debian base.
       - /etc/os-release:/etc/os-release:ro
       - /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro
