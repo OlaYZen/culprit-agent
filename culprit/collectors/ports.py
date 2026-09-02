@@ -10,7 +10,9 @@ Sockets come from psutil (which reads /proc/net/* and, for attribution, each
 owner's /proc/<pid>/fd), exactly as `network.py` does, and the same permission
 truth applies: a listener owned by another user shows with **no PID and is
 counted, never hidden** -- attributing or killing it needs CAP_SYS_PTRACE or
-root, and the payload says so. Process identity (name, cmdline, user) is read
+root, and the payload says so. What it *can* still show is *who* owns it: the
+owner uid comes from world-readable /proc/net, so such a row is named by owner
+even when the process itself is out of reach. Process identity (name, cmdline, user) is read
 straight from /proc for the handful of listening PIDs -- the cheap path
 `processes.py` established -- and systemd unit attribution is threaded in from
 the services collector's pid->unit map, so a row can name `nginx.service`, the
@@ -47,6 +49,93 @@ def _is_loopback(ip: str) -> bool:
         return False
     low = ip.lower()
     return low.startswith("127.") or low == "::1" or low.startswith("::ffff:127.")
+
+
+# /proc/net files carry the owner uid and inode of every socket, unlike psutil.
+# TCP LISTEN is state 0A; a bound UDP socket (our "listener") is state 07.
+_PROC_NET = (
+    ("tcp", "IPv4", "/proc/net/tcp", "0A"),
+    ("tcp", "IPv6", "/proc/net/tcp6", "0A"),
+    ("udp", "IPv4", "/proc/net/udp", "07"),
+    ("udp", "IPv6", "/proc/net/udp6", "07"),
+)
+
+
+def _proc_net_owners() -> dict[tuple[str, str, int], list[tuple[str, int]]]:
+    """{(proto, family, port): [(inode, uid), ...]} for every listening socket.
+
+    /proc/net/* is world-readable and names each socket's owner uid even when
+    that owner's /proc/<pid>/fd is not -- so an unattributed port can still be
+    named by *who* owns it. The inode lets us recover the PID via our own fd
+    scan where psutil's attribution came up empty.
+    """
+    out: dict[tuple[str, str, int], list[tuple[str, int]]] = {}
+    for proto, family, path, want_state in _PROC_NET:
+        text = linux.read_text(path)
+        if not text:
+            continue
+        for line in text.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != want_state:
+                continue
+            _, _, hexport = fields[1].rpartition(":")
+            try:
+                port = int(hexport, 16)
+                uid = int(fields[7])
+            except ValueError:
+                continue
+            out.setdefault((proto, family, port), []).append((fields[9], uid))
+    return out
+
+
+def _inode_to_pid() -> dict[str, int]:
+    """{socket-inode: pid} from our own /proc/<pid>/fd walk.
+
+    psutil does the same scan, but this one runs in-process and skips nothing it
+    can read, so it recovers PIDs psutil sometimes leaves unattributed in a
+    container. Costs one readlink per open fd; only built when a port needs it.
+    """
+    out: dict[str, int] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{name}/fd")
+        except OSError:
+            continue  # gone, or not ours to read
+        pid = int(name)
+        for fd in fds:
+            try:
+                target = os.readlink(f"/proc/{name}/fd/{fd}")
+            except OSError:
+                continue
+            if target.startswith("socket:["):
+                out[target[8:-1]] = pid
+    return out
+
+
+_uid_cache: dict[int, str] = {}
+
+
+def _uid_name(uid: int) -> str:
+    if uid not in _uid_cache:
+        try:
+            _uid_cache[uid] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            _uid_cache[uid] = f"uid {uid}"
+    return _uid_cache[uid]
+
+
+def _unattr_note(count: int, owners: list[str]) -> str | None:
+    if not count:
+        return None
+    who = f" (owned by {', '.join(owners)})" if owners else ""
+    return (f"{count} listening socket(s){who} could not be mapped to a "
+            "process ID from here -- killing them needs CAP_SYS_PTRACE or root.")
 
 
 class PortsCollector:
@@ -87,11 +176,18 @@ class PortsCollector:
                 key = (port, proto)
                 inbound[key] = inbound.get(key, 0) + 1
 
+        # Owner uid of every listening socket, straight from /proc/net (world-
+        # readable). This is how a socket psutil can't attribute still gets a
+        # name: even when /proc/<pid>/fd is unreadable, the uid is not.
+        owners = _proc_net_owners()
+        inode_pid: dict[str, int] | None = None  # our own fd scan, built lazily
+
         by_port: dict[int, dict[str, object]] = {}
         for port, proto, ip, family, pid in listeners:
             slot = by_port.setdefault(port, {
                 "protocols": set(), "addresses": set(), "families": set(),
                 "pids": set(), "unattributed": 0, "public": False,
+                "owner_uids": set(),
             })
             slot["protocols"].add(proto)  # type: ignore[union-attr]
             if ip:
@@ -99,6 +195,22 @@ class PortsCollector:
             slot["families"].add(family)  # type: ignore[union-attr]
             if not _is_loopback(ip):
                 slot["public"] = True
+            if not pid:
+                # psutil left it unattributed. Try our own /proc/<pid>/fd scan
+                # (more permissive than psutil's in some container sandboxes),
+                # then fall back to the /proc/net uid so the row is at least
+                # named by owner even when no PID is reachable.
+                entries = owners.get((proto, family, port)) or []
+                for inode, _uid in entries:
+                    if inode_pid is None:
+                        inode_pid = _inode_to_pid()
+                    recovered = inode_pid.get(inode)
+                    if recovered:
+                        pid = recovered
+                        break
+                if not pid:
+                    for _inode, uid in entries:
+                        slot["owner_uids"].add(uid)  # type: ignore[union-attr]
             if pid:
                 slot["pids"].add(pid)  # type: ignore[union-attr]
             else:
@@ -114,6 +226,7 @@ class PortsCollector:
 
         ports_out: list[dict[str, object]] = []
         public_count = tcp_ports = udp_ports = total_conns = total_unattr = 0
+        all_owners: set[str] = set()
         for port in sorted(by_port):
             slot = by_port[port]
             protocols = sorted(slot["protocols"])  # type: ignore[type-var]
@@ -122,6 +235,9 @@ class PortsCollector:
                          for pid in sorted(slot["pids"])]  # type: ignore[union-attr]
             scope = "public" if slot["public"] else "local"
             unattr = int(slot["unattributed"])
+            owner_names = sorted(_uid_name(uid)
+                                 for uid in slot["owner_uids"])  # type: ignore[union-attr]
+            all_owners.update(owner_names)
 
             public_count += scope == "public"
             tcp_ports += "tcp" in protocols
@@ -137,6 +253,10 @@ class PortsCollector:
                 "families": sorted(slot["families"]),  # type: ignore[type-var]
                 "connections": conns_here,
                 "unattributed": unattr,
+                # Owner login name(s) of any socket we couldn't map to a PID --
+                # so the row names *who* owns it even when the process is out of
+                # reach. Empty when everything on the port is attributed.
+                "owners": owner_names,
                 "processes": processes,
                 # A row is actionable only if at least one owner can be signalled
                 # from here; the UI uses this to enable the Kill button.
@@ -156,10 +276,7 @@ class PortsCollector:
                 "connections": total_conns,
                 "unattributed": total_unattr,
             },
-            "unattributed_note": (
-                f"{total_unattr} listening socket(s) belong to other users' "
-                "processes; naming and killing them needs CAP_SYS_PTRACE or root"
-                if total_unattr else None),
+            "unattributed_note": _unattr_note(total_unattr, sorted(all_owners)),
         }
 
 

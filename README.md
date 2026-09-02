@@ -55,6 +55,8 @@ docker run -d --name culprit-agent --restart unless-stopped \
   --network host --pid host --cap-add SYS_PTRACE \
   --security-opt apparmor=unconfined \
   --env-file .env \
+  -v /etc/passwd:/etc/passwd:ro \
+  -v /etc/group:/etc/group:ro \
   -v /etc/os-release:/etc/os-release:ro \
   -v /var/lib/ubuntu-advantage:/var/lib/ubuntu-advantage:ro \
   -v /var/log/journal:/var/log/journal:ro \
@@ -77,6 +79,7 @@ secret / mounted file).
 | `--network host` | reaches the host node, and sees the host's interfaces and sockets |
 | `--pid host` | sees the host's processes (and their per-process CPU/IO/FDs) |
 | `--cap-add SYS_PTRACE` | reads other users' `/proc/<pid>/io`, fd counts, open files |
+| `-v /etc/passwd + /etc/group` | resolves host UIDs to real login names (else system users read as `uid 101`); also names the owner of a port/process the agent can't fully attribute |
 | `--security-opt apparmor=unconfined` | attributes listening **ports** to their process — the default AppArmor profile blocks the `/proc/<pid>/fd` scan, so without it the Ports view shows every port as "another user's process". A no-op on hosts without AppArmor |
 | `-v /var/log/journal + /etc/machine-id` | the **journal** (Events view) — `journalctl` reads it from files, no daemon needed. Persistent journal assumed; on a volatile-only host mount `/run/log/journal` instead |
 | `-v /run/systemd + /run/dbus` | the **Services (systemd units)** view, the unit **descriptions** on Ports, and login **Sessions** — `systemctl`/`loginctl` reach the host's systemd + D-Bus over these sockets |
@@ -91,11 +94,16 @@ Two honest caveats. The **Ports** view names each listener's systemd unit from
 the process's own cgroup, so the unit **name** shows even without the
 `/run/systemd` mount (the mount adds the friendlier **description**). And
 systemd-over-a-socket from inside a container can be **intermittent** — a
-Services tick may occasionally read "unavailable" and recover on the next one;
-the UI says so rather than pretending. Some managed platforms (e.g. TrueNAS
-SCALE apps) don't let you set `--pid host` / `--security-opt` / these mounts —
-there the agent runs with whatever it's given and degrades the rest. For the
-fullest picture, run the agent natively (`agent.sh`).
+Services tick may occasionally read "unavailable", and the **Services** view
+then falls back to listing the running units read from each process's cgroup
+(no per-unit CPU/memory, no inactive units) rather than showing nothing.
+Likewise a listening **port** the agent can't map to a PID (no `SYS_PTRACE`, or
+a locked-down host) is still named by its **owner** (`systemd-resolve`, `root`,
+…) from `/proc/net` — just not killable from the dashboard. Some managed
+platforms (e.g. TrueNAS SCALE apps) don't let you set `--pid host` /
+`--security-opt` / these mounts — there the agent runs with whatever it's given
+and degrades the rest. For the fullest picture, run the agent natively
+(`agent.sh`).
 
 To build the image yourself: `docker build -t culprit-agent .`
 
