@@ -22,6 +22,8 @@ each, measured) -- see the note in linux.py for why not D-Bus bindings. The
 from __future__ import annotations
 
 import logging
+import os
+import pwd
 import time
 
 from .. import linux
@@ -44,6 +46,13 @@ class ServiceCollector:
         system = self._scope("system")
         user = self._scope("user")
         if not system["available"] and not user["available"]:
+            # The systemd bus is unreachable (typically an agent in a container).
+            # Fall back to enumerating the RUNNING units from process cgroups --
+            # no systemctl needed -- so the view shows the active services
+            # instead of nothing.
+            fallback = self._cgroup_fallback(system["reason"])
+            if fallback is not None:
+                return fallback
             return {"available": False,
                     "reason": system["reason"] or "systemctl produced no output",
                     "services": [], "summary": {}, "problems": [], "by_pid": {},
@@ -88,6 +97,66 @@ class ServiceCollector:
             "cgroup_attribution": linux.cgroup_version() == 2,
             "user_bus": user["available"],
             "user_bus_reason": user["reason"],
+        }
+
+    # -------------------------------------------------------------- cgroup fallback
+    def _cgroup_fallback(self, bus_reason: str | None) -> dict[str, object] | None:
+        """Running units from process cgroups, for when the systemd bus is
+        unreachable (an agent in a container without /run/systemd + /run/dbus).
+
+        No per-unit CPU/memory (those need the host cgroupfs, hidden by the
+        cgroup namespace) and no inactive/failed units or descriptions (those
+        need systemctl) -- but the active services and their main process show,
+        which beats an empty view. Needs to see host processes (--pid host);
+        returns None when nothing is visible so the caller reports unavailable.
+        """
+        groups: dict[str, list[int]] = {}
+        try:
+            entries = os.scandir("/proc")
+        except OSError:
+            return None
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            unit = linux.unit_from_cgroup(int(entry.name))
+            if unit and unit.endswith((".service", ".socket", ".scope")):
+                groups.setdefault(unit, []).append(int(entry.name))
+        if not groups:
+            return None
+
+        services: list[dict[str, object]] = []
+        by_pid: dict[str, list[str]] = {}
+        for name in sorted(groups):
+            leader = min(groups[name])
+            services.append({
+                "name": name, "scope": "system", "display_name": None,
+                "status": "running", "active_state": "active",
+                "sub_state": "running", "load_state": "loaded",
+                "start_type": "transient", "pid": leader,
+                "username": _username_of(leader), "description": None,
+                "result": None, "restarts": None, "exit_status": None,
+                "type": None, "remain_after_exit": False,
+                "condition_result": None, "since": None,
+            })
+            by_pid.setdefault(str(leader), []).append(name)
+        return {
+            "available": True,
+            "reason": None,
+            "degraded": True,
+            "degraded_reason": (
+                f"systemd bus unreachable ({bus_reason or 'no bus'}); showing "
+                "the active units found in process cgroups. No per-unit CPU/"
+                "memory, and no inactive or failed units. Mount /run/systemd + "
+                "/run/dbus (or run the agent natively) for the full view."),
+            "services": services,
+            "summary": {"total": len(services), "denied": 0, "user_units": 0,
+                        "status_running": len(services)},
+            "problems": [],
+            "by_pid": by_pid,
+            "timers": [],
+            "cgroup_attribution": False,
+            "user_bus": False,
+            "user_bus_reason": None,
         }
 
     # ------------------------------------------------------------------ scopes
@@ -275,6 +344,26 @@ def _problem(service: dict, severity: str, detail: str) -> dict[str, object]:
         "restarts": service.get("restarts"),
         "detail": detail,
     }
+
+
+_user_cache: dict[int, str] = {}
+
+
+def _username_of(pid: int) -> str | None:
+    """Owner of a PID, from /proc/<pid>/status (cached per uid)."""
+    uid_row = linux.parse_kv_file(f"/proc/{pid}/status").get("Uid", "").split()
+    if not uid_row:
+        return None
+    try:
+        uid = int(uid_row[0])
+    except ValueError:
+        return None
+    if uid not in _user_cache:
+        try:
+            _user_cache[uid] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            _user_cache[uid] = str(uid)
+    return _user_cache[uid]
 
 
 def _to_int(value: object) -> int | None:
