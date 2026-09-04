@@ -57,7 +57,8 @@ _DEFAULTS = {
 # per tick, so identity is the cheap and exact change test) -- a 1s report
 # cadence therefore costs a few KB per second, not the whole snapshot.
 _DELTA_SECTIONS = ("process_table", "diagnosis", "services", "volumes",
-                   "network_detail", "ports", "sync", "events", "system")
+                   "network_detail", "ports", "sync", "events", "system",
+                   "cgroups", "kernel", "changes")
 # A full snapshot goes out anyway on this period, so drift (like the mutated
 # uptime inside the cached `system` section) never outlives a minute.
 _FULL_SYNC_S = 60.0
