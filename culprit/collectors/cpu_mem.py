@@ -37,6 +37,13 @@ class CpuMemoryCollector:
         self._prev_at = time.monotonic()
         self.psi_available = linux.psi_available()
         self.container = linux.in_container()
+        # Thermal/power throttling counters exist only where the driver
+        # exposes them (x86 with the intel/amd throttle drivers, bare metal);
+        # a VM has none, and the payload says so instead of showing 0 events.
+        self._throttle_paths = _throttle_counter_paths()
+        self._prev_throttle: tuple[float, int] | None = None
+        self._swap_devices: list[dict[str, object]] = []
+        self._swap_checked = 0.0
 
     @property
     def degraded(self) -> dict[str, str]:
@@ -116,6 +123,7 @@ class CpuMemoryCollector:
             "frequency_mhz": _current_mhz(),
             "governor": linux.read_line(
                 "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+            "thermal": self._thermal(elapsed),
             "queue_length": queue,
             "queue_per_core": (None if queue is None
                                else round(queue / logical, 2)),
@@ -126,6 +134,38 @@ class CpuMemoryCollector:
             "logical_cores": logical,
             "process_count": _count_pids(),
             "thread_count": thread_count,
+        }
+
+    def _thermal(self, elapsed: float) -> dict[str, object]:
+        """Thermal / power-limit throttling: the CPU being slowed by its own
+        cooling, which no process can be blamed for. The counters are
+        cumulative throttle events per core; their rate is the signal. The
+        clock ratio (current vs. maximum cpufreq) is the second view of the
+        same thing, where cpufreq exists."""
+        max_khz = linux.read_int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+        cur_khz = linux.read_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+        ratio = (round(cur_khz / max_khz, 3) if max_khz and cur_khz else None)
+        if not self._throttle_paths:
+            return {
+                "available": False,
+                "reason": ("no thermal_throttle counters in sysfs -- a virtual "
+                           "machine, or a platform whose CPU driver does not "
+                           "expose them; throttling cannot be observed here"),
+                "throttle_events_sec": None, "throttle_count": None,
+                "clock_ratio": ratio, "max_mhz": (max_khz or 0) / 1000 or None,
+            }
+        total = 0
+        for path in self._throttle_paths:
+            total += linux.read_int(path) or 0
+        rate = None
+        if self._prev_throttle is not None:
+            rate = max(0.0, (total - self._prev_throttle[1]) / elapsed)
+        self._prev_throttle = (time.monotonic(), total)
+        return {
+            "available": True, "reason": None,
+            "throttle_events_sec": None if rate is None else round(rate, 2),
+            "throttle_count": total,
+            "clock_ratio": ratio, "max_mhz": (max_khz or 0) / 1000 or None,
         }
 
     # --------------------------------------------------------------- memory
@@ -159,6 +199,15 @@ class CpuMemoryCollector:
         minflt = _rate_of(vmstat, prev, "pgfault", elapsed)
         swap_in = _rate_of(vmstat, prev, "pswpin", elapsed)
         swap_out = _rate_of(vmstat, prev, "pswpout", elapsed)
+        # Which devices back swap, and whether any is a spinning disk: paging
+        # to rotational storage costs a seek per page, which is the case
+        # where "swapping" is a hardware verdict rather than a process's fault.
+        # /proc/swaps changes on swapon/swapoff only, so a minute is plenty.
+        now = time.monotonic()
+        if now - self._swap_checked > 60.0:
+            self._swap_devices = _swap_devices()
+            self._swap_checked = now
+        rotational_flags = [d.get("rotational") for d in self._swap_devices]
 
         return {
             "total": total,
@@ -186,6 +235,13 @@ class CpuMemoryCollector:
                              if swap_total else 0.0),
             "swap_in_sec": None if swap_in is None else round(swap_in, 1),
             "swap_out_sec": None if swap_out is None else round(swap_out, 1),
+            "swap_devices": self._swap_devices,
+            # True if any swap device spins; None when there is no swap or the
+            # device type could not be read (never a guessed False).
+            "swap_rotational": (True if any(f is True for f in rotational_flags)
+                                else False if rotational_flags
+                                and all(f is False for f in rotational_flags)
+                                else None),
             # Cumulative OOM kills since boot; the sampler diffs it for alerts.
             "oom_kills_total": vmstat.get("oom_kill"),
             "dirty": linux.meminfo_kb(info, "Dirty"),
@@ -273,6 +329,92 @@ def _count_pids() -> int:
         return sum(1 for name in os.listdir("/proc") if name.isdigit())
     except OSError:
         return 0
+
+
+def _throttle_counter_paths() -> list[str]:
+    base = "/sys/devices/system/cpu"
+    out: list[str] = []
+    try:
+        for entry in os.listdir(base):
+            if not (entry.startswith("cpu") and entry[3:].isdigit()):
+                continue
+            for name in ("core_throttle_count", "package_throttle_count"):
+                path = f"{base}/{entry}/thermal_throttle/{name}"
+                if os.path.exists(path):
+                    out.append(path)
+    except OSError:
+        pass
+    return out
+
+
+def _swap_devices() -> list[dict[str, object]]:
+    """Every active swap area with the rotational flag of the disk under it.
+
+    A swap *file* is resolved through the filesystem it lives on (st_dev), a
+    partition through its device node (st_rdev); dm/md devices are followed
+    down through /sys/dev/block/<maj:min>/slaves to a real disk. Anything
+    that cannot be resolved reports rotational=None.
+    """
+    text = linux.read_text("/proc/swaps")
+    out: list[dict[str, object]] = []
+    if not text:
+        return out
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        path, kind = parts[0], parts[1]
+        try:
+            size_kb = int(parts[2])
+        except ValueError:
+            size_kb = None
+        rotational: bool | None = None
+        try:
+            st = os.stat(path)
+            dev = st.st_rdev if kind == "partition" and st.st_rdev else st.st_dev
+            rotational = _rotational_of(os.major(dev), os.minor(dev))
+        except OSError:
+            pass
+        out.append({"path": path, "type": kind, "size_kb": size_kb,
+                    "rotational": rotational})
+    return out
+
+
+def _rotational_of(major: int, minor: int, depth: int = 0) -> bool | None:
+    """queue/rotational for a block device, following partitions up to their
+    disk and layered (dm/md) devices down to their slaves."""
+    if depth > 4:
+        return None
+    try:
+        node = os.path.realpath(f"/sys/dev/block/{major}:{minor}")
+    except OSError:
+        return None
+    if not os.path.isdir(node):
+        return None
+    # A partition directory has a `partition` file; its disk is the parent.
+    if os.path.exists(f"{node}/partition"):
+        node = os.path.dirname(node)
+    try:
+        slaves = os.listdir(f"{node}/slaves")
+    except OSError:
+        slaves = []
+    if slaves:
+        flags = []
+        for slave in slaves:
+            dev = linux.read_line(f"{node}/slaves/{slave}/dev")
+            if dev and ":" in dev:
+                maj, _, mino = dev.partition(":")
+                try:
+                    flags.append(_rotational_of(int(maj), int(mino), depth + 1))
+                except ValueError:
+                    pass
+        if any(f is True for f in flags):
+            return True
+        if flags and all(f is False for f in flags):
+            return False
+        return None
+    value = linux.read_int(f"{node}/queue/rotational")
+    return None if value is None else bool(value)
 
 
 def _current_mhz() -> float | None:

@@ -307,6 +307,7 @@ class Sampler:
             "mode": result["mode"],
             "degraded_reason": result["degraded_reason"],
             "io_note": result["io_note"],
+            "container_note": result.get("container_note"),
             "truncated": len(ranked) - len(trimmed),
             "ts": time.time(),
         }

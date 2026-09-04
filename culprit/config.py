@@ -15,6 +15,8 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from . import trust
+
 ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("culprit.config")
 
@@ -111,6 +113,36 @@ class Config:
     deploy_host: str = ""            # e.g. "192.168.1.5:8787" or "https://hub:8787"
     agent_command: str = "./agent.sh"
 
+    # --- network trust ----------------------------------------------------
+    # Reverse proxies are refused until declared: a request that carries a
+    # forwarding header (X-Forwarded-For, Forwarded, X-Real-IP, ...) from a
+    # peer not listed here gets a 400, because honouring the header would let
+    # any client pick the address the login limiter keys on, and ignoring it
+    # would hide an undeclared proxy (everyone behind it sharing one limiter
+    # bucket). IPs or CIDR ranges; `--trust-proxy` adds to this for one run.
+    trusted_proxies: list[str] = field(default_factory=list)
+    # Host header allow-list. Empty = any Host accepted (a wrong list locks
+    # the operator out from the network, so this is opt-in); loopback names
+    # always pass so a shell on the machine can fix it. Names, `*.domain`
+    # wildcards, or IP literals -- no ports, the port is never compared.
+    trusted_hosts: list[str] = field(default_factory=list)
+
+    # --- notifications (host only) ----------------------------------------
+    # Only *findings* are ever sent -- diagnoses that survived the sustain
+    # window -- never a raw threshold. Empty = channel off. See notify.py.
+    notify_ntfy_url: str = ""          # e.g. https://ntfy.sh/my-topic
+    notify_webhook_url: str = ""       # any endpoint accepting a JSON POST
+    notify_smtp_host: str = ""
+    notify_smtp_port: int = 587
+    notify_smtp_user: str = ""
+    notify_smtp_password: str = ""     # never returned by the API
+    notify_smtp_from: str = ""
+    notify_smtp_to: str = ""
+    notify_smtp_tls: bool = True       # STARTTLS (port 465 uses implicit TLS)
+    notify_min_severity: str = "warn"  # "warn" or "critical"
+    notify_resolved: bool = True       # send a follow-up when a finding clears
+    notify_offline: bool = True        # send when an agent stops reporting
+
     # --- ui ---
     ui: dict[str, Any] = field(default_factory=dict)
 
@@ -164,6 +196,55 @@ EDITABLE = {
     "event_lookback_days", "event_max_per_source",
     "allow_process_actions", "open_browser", "ui",
     "deploy_host", "agent_command",
+    "trusted_proxies", "trusted_hosts",
+    "notify_ntfy_url", "notify_webhook_url", "notify_smtp_host",
+    "notify_smtp_port", "notify_smtp_user", "notify_smtp_password",
+    "notify_smtp_from", "notify_smtp_to", "notify_smtp_tls",
+    "notify_min_severity", "notify_resolved", "notify_offline",
+}
+
+# Text fields with a shape: the validator returns the cleaned value or
+# raises ValueError with a message the Settings form shows inline.
+def _url_or_empty(value: str) -> str:
+    value = value.strip()
+    if value and not value.startswith(("http://", "https://")):
+        raise ValueError("must start with http:// or https://")
+    if len(value) > 512:
+        raise ValueError("too long")
+    return value
+
+
+def _severity(value: str) -> str:
+    value = value.strip().lower()
+    if value not in ("warn", "critical"):
+        raise ValueError("expected 'warn' or 'critical'")
+    return value
+
+
+def _short_text(value: str) -> str:
+    value = value.strip()
+    if len(value) > 256:
+        raise ValueError("too long")
+    if any(c in value for c in "\r\n"):
+        raise ValueError("must be a single line")
+    return value
+
+
+TEXT_VALIDATORS: dict[str, Any] = {
+    "notify_ntfy_url": _url_or_empty,
+    "notify_webhook_url": _url_or_empty,
+    "notify_min_severity": _severity,
+    "notify_smtp_host": _short_text,
+    "notify_smtp_user": _short_text,
+    "notify_smtp_password": _short_text,
+    "notify_smtp_from": _short_text,
+    "notify_smtp_to": _short_text,
+}
+
+# Lists of text entries, validated by culprit.trust rather than by range.
+LIST_FIELDS: dict[str, Any] = {
+    "trusted_proxies": trust.clean_proxies,
+    "trusted_hosts": trust.parse_hosts,
 }
 
 # Accepted ranges for editable numeric fields, used by the API to reject
@@ -194,6 +275,7 @@ LIMITS: dict[str, tuple[float, float]] = {
     "weight_gpu": (0, 10), "weight_faults": (0, 10), "weight_stuck": (0, 10),
     "event_lookback_days": (1, 3650),
     "event_max_per_source": (10, 5000),
+    "notify_smtp_port": (1, 65535),
 }
 
 
@@ -224,6 +306,8 @@ def load() -> Config:
                     value = bool(value)
                 elif spec.type in ("str", str):
                     value = str(value)
+                elif key in LIST_FIELDS:
+                    value = _load_list(key, value)
             except (TypeError, ValueError):
                 continue
             setattr(cfg, key, value)
@@ -233,6 +317,22 @@ def load() -> Config:
     with _lock:
         _current = cfg
     return cfg
+
+
+def _load_list(key: str, value: Any) -> list[str]:
+    """A hand-edited config.json may hold anything. Keep the entries that
+    parse and log the rest: a dropped proxy entry fails closed (its requests
+    are refused, which is visible), a dropped host entry only tightens."""
+    entries = trust.split_entries(value)
+    kept: list[str] = []
+    for entry in entries:
+        try:
+            LIST_FIELDS[key]([entry])
+        except ValueError as exc:
+            log.warning("config.json %s: dropping %s", key, exc)
+            continue
+        kept.append(entry)
+    return kept
 
 
 def update(patch: dict[str, Any], persist: bool = True) -> tuple[Config, list[str]]:
@@ -260,6 +360,14 @@ def update(patch: dict[str, Any], persist: bool = True) -> tuple[Config, list[st
                 errors.append(f"{key}: not editable at runtime")
                 continue
             spec = known[key]
+            if key in LIST_FIELDS:
+                try:
+                    value = LIST_FIELDS[key](trust.split_entries(value))
+                except ValueError as exc:
+                    errors.append(f"{key}: {exc}")
+                    continue
+                setattr(cfg, key, value)
+                continue
             try:
                 if spec.type in ("bool", bool):
                     value = bool(value)
@@ -269,8 +377,11 @@ def update(patch: dict[str, Any], persist: bool = True) -> tuple[Config, list[st
                     value = float(value)
                 elif spec.type in ("str", str):
                     value = str(value).strip()
-            except (TypeError, ValueError):
-                errors.append(f"{key}: expected a number")
+                    if key in TEXT_VALIDATORS:
+                        value = TEXT_VALIDATORS[key](value)
+            except (TypeError, ValueError) as exc:
+                errors.append(f"{key}: {exc}" if key in TEXT_VALIDATORS
+                              else f"{key}: expected a number")
                 continue
             if key in LIMITS:
                 low, high = LIMITS[key]

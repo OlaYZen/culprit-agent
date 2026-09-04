@@ -228,14 +228,23 @@ class LagAnalyzer:
         candidates: list[dict[str, object]] = []
 
         def consider(key: str, active: bool, severity: str, title: str,
-                     detail: str, resource: str, evidence: dict[str, object]) -> None:
+                     detail: str, resource: str, evidence: dict[str, object],
+                     blame: str | None = None) -> None:
             streak = self._sustain.feed(key, active)
             if active and streak >= cfg.sustain_ticks:
-                candidates.append({
+                finding: dict[str, object] = {
                     "key": key, "severity": severity, "title": title,
                     "detail": detail, "resource": resource,
                     "evidence": evidence, "sustained_ticks": streak,
-                })
+                }
+                if blame:
+                    # "Nobody on this machine is at fault": the cause is
+                    # outside the process table (hypervisor, cooling, the
+                    # swap device, a file server). No culprits are listed,
+                    # because ranking processes under it would invent blame.
+                    finding["external"] = True
+                    finding["blame"] = blame
+                candidates.append(finding)
 
         # --- PSI: the kernel's own stall measurements ----------------------
         psi_cpu = _psi_avg10(psi, "cpu", "some")
@@ -295,13 +304,34 @@ class LagAnalyzer:
         steal = float(cpu.get("steal") or 0.0)
         consider(
             "cpu_steal", steal >= 10.0,
-            "warn",
+            "critical" if steal >= 30.0 else "warn",
             "Hypervisor stealing CPU time",
             f"{steal:.0f}% of CPU time was taken by the hypervisor for other "
             "guests. This VM is slow because of its neighbours, not its own "
-            "workload -- nothing inside the guest can fix it.",
+            "workload -- nothing inside the guest can fix it. Ask the "
+            "platform for a less contended host, or reserve CPU for this VM.",
             "cpu", {"steal_percent": round(steal, 1)},
+            blame="the hypervisor (noisy neighbours), not a process here",
         )
+        thermal = cpu.get("thermal") or {}
+        if thermal.get("available"):
+            events = float(thermal.get("throttle_events_sec") or 0.0)
+            ratio = thermal.get("clock_ratio")
+            consider(
+                "thermal_throttle", events >= 1.0,
+                "critical" if events >= 20.0 else "warn",
+                "CPU throttled by its thermal or power limit",
+                f"The CPU logged {events:.0f} throttle events/s: it is cutting "
+                "its own clock to stay within a temperature or power limit"
+                + (f" (running at {float(ratio) * 100:.0f}% of its maximum "
+                   "frequency)" if isinstance(ratio, (int, float)) else "")
+                + ". Everything runs slower and no process caused it -- look "
+                "at cooling, dust, airflow, or the power profile.",
+                "cpu", {"throttle_events_sec": round(events, 1),
+                        "clock_ratio": ratio,
+                        "frequency_mhz": cpu.get("frequency_mhz")},
+                blame="the CPU's cooling or power limit, not a process",
+            )
 
         # --- Memory --------------------------------------------------------
         available_mb = memory.get("available_mb")
@@ -338,6 +368,27 @@ class LagAnalyzer:
             "disk instead of RAM -- the classic cause of whole-system stutter.",
             "memory", {"hard_faults_sec": round(hard_faults)},
         )
+        swap_pages = (float(memory.get("swap_in_sec") or 0.0)
+                      + float(memory.get("swap_out_sec") or 0.0))
+        if memory.get("swap_rotational") is True:
+            slow_devices = ", ".join(
+                str(d.get("path")) for d in (memory.get("swap_devices") or [])
+                if isinstance(d, dict) and d.get("rotational"))
+            consider(
+                "swap_slow", swap_pages >= 100.0,
+                "critical" if swap_pages >= 2000.0 else "warn",
+                "Swapping to a spinning disk",
+                f"{swap_pages:,.0f} pages/s are moving to or from swap on a "
+                f"rotational disk ({slow_devices}). Every page brought back "
+                "costs a seek, so this stalls the whole machine far harder "
+                "than the same paging on an SSD would. The fix is hardware: "
+                "move swap to solid-state storage, or add RAM.",
+                "memory", {"swap_in_sec": memory.get("swap_in_sec"),
+                           "swap_out_sec": memory.get("swap_out_sec"),
+                           "swap_device": slow_devices},
+                blame="the swap device (a rotational disk), not a process",
+            )
+
         # OOM kills: an event, not a level, so it bypasses the sustain window.
         oom_total = memory.get("oom_kills_total")
         if isinstance(oom_total, int):
@@ -428,10 +479,15 @@ class LagAnalyzer:
         if stuck:
             names = ", ".join(sorted({str(p["name"]) for p in stuck})[:4])
             wchans = sorted({str(p.get("wchan")) for p in stuck if p.get("wchan")})
-            candidates.append({
+            plural = "es" if len(stuck) != 1 else ""
+            # The kernel function they are blocked in says *what* they wait
+            # on. A cluster of NFS/SMB/FUSE waits is a file server (or the
+            # network to it) stalling, not anything on this machine.
+            remote = _remote_storage_cluster(wchans)
+            finding = {
                 "key": "stuck_procs", "severity": "critical",
-                "title": f"{len(stuck)} process{'es' if len(stuck) != 1 else ''} "
-                         "stuck in uninterruptible sleep",
+                "title": f"{len(stuck)} process{plural} stuck in "
+                         "uninterruptible sleep",
                 "detail": f"{names} have sat in D-state for several consecutive "
                           "samples -- blocked inside the kernel, almost always "
                           "on dead storage or an unreachable network mount. "
@@ -439,13 +495,33 @@ class LagAnalyzer:
                           + (f" Blocked in: {', '.join(wchans[:3])}." if wchans
                              else ""),
                 "resource": "responsiveness",
-                "evidence": {"pids": [p["pid"] for p in stuck]},
+                "evidence": {"pids": [p["pid"] for p in stuck],
+                             "wchan": ", ".join(wchans[:3]) or None},
                 "sustained_ticks": cfg.sustain_ticks,
-            })
+            }
+            if remote:
+                finding["title"] = (f"{len(stuck)} process{plural} stuck waiting "
+                                    f"on {remote}")
+                finding["detail"] = (
+                    f"{names} are blocked inside the kernel's {remote} client "
+                    f"({', '.join(wchans[:3])}). The processes listed are the "
+                    "victims, not the cause: the server on the other end (or "
+                    "the network path to it) is not answering. Killing them "
+                    "does nothing until the mount responds -- check the "
+                    "server, then the mount options (soft/hard, timeo).")
+                finding["external"] = True
+                finding["blame"] = f"the {remote} server or the network to it"
+                finding["victims"] = True
+            candidates.append(finding)
 
         # Attribute each finding to the processes actually driving that resource.
+        # An external finding lists no culprits -- unless the listed processes
+        # are its *victims* (D-state), which the finding then says outright.
         for finding in candidates:
-            finding["culprits"] = _culprits(processes, str(finding["resource"]))
+            if finding.get("external") and not finding.get("victims"):
+                finding["culprits"] = []
+            else:
+                finding["culprits"] = _culprits(processes, str(finding["resource"]))
 
         candidates.sort(key=lambda f: (
             -SEVERITY_ORDER.index(str(f["severity"])),
@@ -525,9 +601,37 @@ def _culprits(processes: list[dict], resource: str) -> list[dict[str, object]]:
             "io_bytes_sec": p.get("io_bytes_sec"), "gpu": p.get("gpu"),
             "stuck": p.get("stuck"), "lag_score": p.get("lag_score"),
             "share": _share_text(p, resource),
+            "container": p.get("container"),
         }
         for p in ranked
     ]
+
+
+# wchan prefixes that mean "waiting on a remote filesystem". The kernel
+# function name is the only evidence there is, and it is specific enough.
+_REMOTE_WCHAN = (
+    (("nfs", "rpc_", "__nfs", "xprt_"), "NFS"),
+    (("cifs", "smb", "SMB"), "SMB/CIFS"),
+    (("fuse_", "request_wait_answer"), "FUSE"),
+    (("ceph_", "rbd_"), "Ceph"),
+    (("glusterfs", "gf_"), "GlusterFS"),
+)
+
+
+def _remote_storage_cluster(wchans: list[str]) -> str | None:
+    """The remote filesystem the stuck processes are waiting on, when every
+    known wait function points at the same one (a mixed bag is not a verdict)."""
+    if not wchans:
+        return None
+    labels: set[str] = set()
+    for wchan in wchans:
+        for prefixes, label in _REMOTE_WCHAN:
+            if wchan.startswith(prefixes):
+                labels.add(label)
+                break
+        else:
+            return None   # a local wait in the mix: not a remote-storage verdict
+    return labels.pop() if len(labels) == 1 else None
 
 
 def _share_text(proc: dict, resource: str) -> str:
@@ -620,7 +724,7 @@ def _slim(proc: dict) -> dict[str, object]:
             "working_set", "private", "io_bytes_sec", "read_bytes_sec",
             "write_bytes_sec", "gpu", "vram", "threads", "page_faults_sec",
             "major_faults_sec", "run_delay_ms", "state", "stuck", "wchan",
-            "lag_score", "lag_breakdown", "lag_reasons", "exe",
+            "lag_score", "lag_breakdown", "lag_reasons", "exe", "container",
         )
     }
 
@@ -640,9 +744,13 @@ def _headline(severity: str, findings: list[dict]) -> str:
         return "No sustained resource pressure detected."
     top = findings[0]
     culprits = top.get("culprits") or []
+    if top.get("external"):
+        return f"{top['title']} - outside this machine: {top.get('blame')}."
     if culprits:
         lead = culprits[0]
-        return f"{top['title']} - {lead['name']} ({lead['share']}) leads."
+        where = lead.get("container") or {}
+        inside = f" in {where['name']}" if where.get("name") else ""
+        return f"{top['title']} - {lead['name']}{inside} ({lead['share']}) leads."
     return str(top["title"])
 
 
@@ -653,4 +761,7 @@ def _mb(value: object) -> str:
         return "0 MB"
     if number >= 1024 ** 3:
         return f"{number / 1024 ** 3:.1f} GB"
+    if number < 1024 ** 2:
+        # "0 MB/s" next to a ranked culprit reads as a lie; say what it is.
+        return f"{number / 1024:.0f} KB"
     return f"{number / 1024 ** 2:.0f} MB"

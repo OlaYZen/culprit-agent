@@ -32,12 +32,14 @@ import logging
 import os
 import pwd
 import signal
+import subprocess
 import time
 from dataclasses import dataclass
 
 import psutil
 
 from .. import linux
+from .containers import ContainerResolver, identify
 
 log = logging.getLogger("culprit.processes")
 
@@ -66,6 +68,9 @@ class _Static:
     exe: str | None = None
     username: str | None = None
     is_kthread: bool = False
+    # (runtime, container id) when the cgroup path says the process lives in
+    # a container; the name is looked up (and cached) by the resolver.
+    container: tuple[str, str] | None = None
 
 
 class ProcessCollector:
@@ -81,6 +86,7 @@ class ProcessCollector:
         self._cpu_history: dict[int, list[float]] = {}
         self._d_streak: dict[int, int] = {}
         self._boot_time = psutil.boot_time()
+        self.containers = ContainerResolver()
         self.mode = "proc"
         self.degraded_reason: str | None = None
         self.last_duration_ms = 0.0
@@ -98,6 +104,7 @@ class ProcessCollector:
         rows: list[dict[str, object]] = []
         live_pids: set[int] = set()
         io_denied = 0
+        self.containers.begin_tick()
 
         for entry in os.scandir("/proc"):
             if not entry.name.isdigit():
@@ -123,6 +130,7 @@ class ProcessCollector:
                       self._d_streak):
             for pid in set(cache) - live_pids:
                 cache.pop(pid, None)
+        self.containers.forget_except(self.containers.seen)
 
         real = [r for r in rows if not r["is_kthread"]]
         totals = {
@@ -144,6 +152,9 @@ class ProcessCollector:
             "zombies": sum(1 for r in rows if r["raw_state"] == "Z"),
             "io_unreadable": io_denied,
             "unresolved": sum(1 for r in rows if not r.get("username")),
+            # Distinct containers with at least one live process.
+            "containers": len(self.containers.seen),
+            "container_processes": sum(1 for r in rows if r.get("container")),
         }
         by_state: dict[str, int] = {}
         for row in rows:
@@ -165,6 +176,8 @@ class ProcessCollector:
                 "need CAP_SYS_PTRACE (ptrace_scope="
                 f"{linux.ptrace_scope()})" if io_denied else None
             ),
+            # Why some container processes carry only an id: names the socket.
+            "container_note": self.containers.note(),
         }
 
     # ---------------------------------------------------------------- per-pid
@@ -300,6 +313,12 @@ class ProcessCollector:
             "is_idle": False,
             "is_self": pid == self._own_pid,
             "access_denied": static.username is None,
+            # {runtime, id, name, image, service, project} or None. Looked up
+            # per tick from the resolver's cache so a name that becomes
+            # readable later (socket access granted) shows up without a
+            # restart; the cgroup read itself happened once, in _resolve_static.
+            "container": (self.containers.entry(*static.container)
+                          if static.container else None),
             "_io_denied": io_denied,
         }
 
@@ -331,6 +350,8 @@ class ProcessCollector:
         # Prefer the comm from stat, but a zero-length name means a race.
         if not static.name:
             static.name = status.get("Name", f"pid-{pid}")
+        if not static.is_kthread:
+            static.container = identify(linux.cgroup_path_of(pid))
         return static
 
     def _fd_count(self, pid: int) -> int | None:
@@ -411,6 +432,11 @@ class ProcessCollector:
             detail["wchan"] = linux.read_line(f"/proc/{pid}/wchan") or None
             detail["cgroup"] = _cgroup_of(pid)
             detail["oom_score"] = linux.read_int(f"/proc/{pid}/oom_score")
+            detail["container"] = self.containers.resolve(detail["cgroup"])
+            # The systemd unit (or container scope) this process runs in, with
+            # its current CPU quota / IO weight and how many processes share
+            # it -- what a throttle would act on, stated before it is offered.
+            detail["unit"] = unit_info(pid)
 
             detail["parent"] = _parent_summary(proc)
             detail["children"] = _children_summary(proc)
@@ -618,6 +644,152 @@ def set_priority(pid: int, level: str) -> dict[str, object]:
                           "user's process cannot be reniced at all."}
     except Exception as exc:
         return {"ok": False, "reason": str(exc)}
+
+
+# Throttling: cap the *unit* (cgroup) a process belongs to, via systemd's
+# runtime properties. A backup or indexer that is hurting interactive work
+# should usually be slowed, not killed: this is reversible, survives the
+# process forking, and is exactly what `systemctl set-property --runtime`
+# exists for. It acts on the whole unit -- every process in that cgroup --
+# which the caller is told up front (`unit_info` counts them), because
+# throttling `session-3.scope` throttles someone's entire SSH session.
+#
+# CPUQuota is relative to ONE cpu in systemd (200% = two cores), so the
+# presets are scaled by the core count to mean a share of the machine.
+_THROTTLE_LEVELS = {
+    "half": (0.50, "50"),        # half the machine's CPU, half the IO weight
+    "quarter": (0.25, "10"),     # a quarter of the CPU, near-idle IO weight
+    "release": (None, None),     # reset both to unlimited / default
+}
+_UNTHROTTLEABLE = {"init.scope", "dbus.service", "systemd-journald.service",
+                   "systemd-logind.service", "systemd-udevd.service"}
+
+
+def unit_info(pid: int) -> dict[str, object] | None:
+    """The cgroup-v2 unit owning a PID and its current resource limits.
+
+    Read straight from the cgroup files, not from systemctl, so it is cheap
+    enough for the detail panel and works without the bus. None when no
+    unit owns the process (cgroup v1, or a bare cgroup outside systemd).
+    """
+    path = linux.cgroup_path_of(pid)
+    unit = linux.unit_from_cgroup(pid)
+    if not path or not unit or linux.cgroup_version() != 2:
+        return None
+    segments = [s for s in path.strip("/").split("/") if s and s != ".."]
+    try:
+        depth = max(i for i, seg in enumerate(segments) if seg == unit)
+    except ValueError:
+        return None
+    unit_dir = linux.CGROUP_ROOT.joinpath(*segments[:depth + 1])
+    # Units run by a user's own manager sit under user@<uid>.service and are
+    # addressed with `systemctl --user`; everything else (system services,
+    # login session scopes, container scopes) belongs to the system manager.
+    manager = "user" if any(seg.startswith("user@") and seg.endswith(".service")
+                            for seg in segments[:depth]) else "system"
+    procs = linux.read_text(unit_dir / "cgroup.procs")
+    cores = os.cpu_count() or 1
+    quota_pct = _cpu_quota_pct(linux.read_line(unit_dir / "cpu.max"))
+    weight = linux.read_line(unit_dir / "io.weight")
+    io_weight = None
+    if weight:
+        try:
+            io_weight = int(weight.split()[-1])
+        except ValueError:
+            io_weight = None
+    return {
+        "name": unit,
+        "manager": manager,
+        "cgroup": "/" + "/".join(segments[:depth + 1]),
+        "process_count": (len(procs.split()) if procs is not None else None),
+        # Percent of the whole machine (systemd's own number is per-CPU).
+        "cpu_quota_pct": (None if quota_pct is None
+                          else round(quota_pct / cores, 1)),
+        "io_weight": io_weight,
+        "io_controller": (unit_dir / "io.weight").exists(),
+        "throttled": quota_pct is not None or (io_weight is not None
+                                               and io_weight != 100),
+        "container": identify(path) is not None,
+    }
+
+
+def _cpu_quota_pct(cpu_max: str | None) -> float | None:
+    """'50000 100000' -> 50.0 (of one CPU); 'max 100000' -> None."""
+    if not cpu_max:
+        return None
+    parts = cpu_max.split()
+    if len(parts) != 2 or parts[0] == "max":
+        return None
+    try:
+        return 100.0 * int(parts[0]) / int(parts[1])
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def throttle(pid: int, level: str) -> dict[str, object]:
+    """Cap the CPU share and IO weight of the unit a process belongs to."""
+    if level not in _THROTTLE_LEVELS:
+        return {"ok": False,
+                "reason": f"unknown throttle level {level!r}; expected one of "
+                          f"{', '.join(_THROTTLE_LEVELS)}"}
+    allowed, reason = can_act(pid, "throttle")
+    if not allowed:
+        return {"ok": False, "reason": reason}
+    info = unit_info(pid)
+    if info is None:
+        return {"ok": False,
+                "reason": "no systemd unit owns this process, so there is no "
+                          "cgroup to cap (this needs cgroup v2 under systemd)"}
+    unit = str(info["name"])
+    own = linux.unit_from_cgroup(os.getpid())
+    if unit in _UNTHROTTLEABLE or (own and unit == own):
+        return {"ok": False,
+                "reason": (f"{unit} is the unit running Culprit itself"
+                           if own and unit == own else
+                           f"{unit} is a critical system unit; capping it "
+                           "would stall the machine")}
+    share, io_weight = _THROTTLE_LEVELS[level]
+    cores = os.cpu_count() or 1
+    if share is None:
+        props = ["CPUQuota=", "IOWeight="]
+    else:
+        props = [f"CPUQuota={int(share * 100 * cores)}%", f"IOWeight={io_weight}"]
+    argv = ["systemctl"] + (["--user"] if info["manager"] == "user" else []) \
+        + ["set-property", "--runtime", unit] + props
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True,
+                                   timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "reason": f"systemctl could not run: {exc}"}
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "").strip()
+        if "authentication" in err.lower() or "access denied" in err.lower() \
+                or "permission" in err.lower():
+            return {"ok": False,
+                    "reason": ("Permission denied: capping a system unit "
+                               f"({unit}) needs root, or a polkit rule granting "
+                               "org.freedesktop.systemd1.manage-units to the "
+                               "agent's user.")}
+        return {"ok": False, "reason": f"systemctl: {err[:300] or 'failed'}"}
+    # systemd applies the cgroup change asynchronously after it replies; a
+    # read in the same millisecond still shows the old quota.
+    time.sleep(0.25)
+    after = unit_info(pid) or info
+    try:
+        name = psutil.Process(pid).name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        name = None
+    note = None
+    if share is not None and not after.get("io_controller"):
+        note = ("CPU quota applied; the IO weight had no effect because the "
+                "io controller is not enabled for this cgroup's parent.")
+    return {
+        "ok": True, "pid": pid, "name": name, "unit": unit, "level": level,
+        "manager": info["manager"], "before": info, "after": after,
+        "process_count": after.get("process_count"),
+        "runtime_only": True,   # --runtime: cleared by a reboot or daemon-reload
+        "note": note,
+    }
 
 
 def _nice_label(value: object) -> str | None:
