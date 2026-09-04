@@ -58,7 +58,7 @@ _DEFAULTS = {
 # cadence therefore costs a few KB per second, not the whole snapshot.
 _DELTA_SECTIONS = ("process_table", "diagnosis", "services", "volumes",
                    "network_detail", "ports", "sync", "events", "system",
-                   "cgroups", "kernel", "changes")
+                   "cgroups", "kernel", "changes", "ceilings")
 # A full snapshot goes out anyway on this period, so drift (like the mutated
 # uptime inside the cached `system` section) never outlives a minute.
 _FULL_SYNC_S = 60.0

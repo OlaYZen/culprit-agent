@@ -36,6 +36,7 @@ from .collectors import network as net_mod
 from .collectors import ports as ports_mod
 from .collectors import processes as proc_mod
 from .collectors import services as svc_mod
+from .collectors import ceilings as ceilings_mod
 from .collectors import cgroups as cgroups_mod
 from .collectors import kernel as kernel_mod
 from .collectors.changes import ChangeLog
@@ -105,6 +106,7 @@ class Sampler:
         # fed by every tier and read by the doctor.
         self.cgroups: cgroups_mod.CgroupCollector | None = None
         self.kernel: kernel_mod.KernelCollector | None = None
+        self.ceilings: ceilings_mod.CeilingCollector | None = None
         self.changes: ChangeLog | None = None
 
         # Rollup accumulation.
@@ -297,7 +299,8 @@ class Sampler:
         volumes = (self.store.get("volumes") or {}).get("volumes") or []
         diagnosis = self.lag.diagnose(snapshot, processes, pressures, cfg,
                                       volumes=volumes, cgroups=cgroups,
-                                      kernel=kernel, changes=self.changes)
+                                      kernel=kernel, changes=self.changes,
+                                      ceilings=self.store.get("ceilings"))
 
         # Annotate unit main processes with the units they belong to.
         service_map = (self.store.get("services") or {}).get("by_pid") or {}
@@ -353,8 +356,13 @@ class Sampler:
             self.ports = ports_mod.PortsCollector()
         if self.sync is None:
             self.sync = sync_mod.SyncCollector()
+        if self.ceilings is None:
+            self.ceilings = ceilings_mod.CeilingCollector()
 
-        volumes = self.volumes.sample()
+        # The volume collector names the processes writing to each mount
+        # (open files under it) from the latest process table.
+        table = (self.store.get("process_table") or {}).get("processes") or []
+        volumes = self.volumes.sample(processes=table)
         services = self.services.sample()
         net_detail = self.net_detail.sample()
         # The port map names the systemd unit behind each listener from the
@@ -367,11 +375,13 @@ class Sampler:
                                   unit_desc=_unit_desc)
         sync = self.sync.sample()
         system = sysinfo_mod.collect()  # cheap; refreshes uptime
+        # Ceilings name their holders the way the process table does.
+        ceilings = self.ceilings.sample(processes=table)
 
         payload = {
             "volumes": volumes, "services": services,
             "network_detail": net_detail, "ports": ports, "sync": sync,
-            "system": system, "ts": time.time(),
+            "system": system, "ceilings": ceilings, "ts": time.time(),
         }
         if self.changes is not None:
             # Diff against the previous slow tick; the log itself is what
