@@ -39,6 +39,7 @@ from dataclasses import dataclass
 import psutil
 
 from .. import linux
+from . import kernel as kernel_mod
 from .containers import ContainerResolver, identify
 
 log = logging.getLogger("culprit.processes")
@@ -71,6 +72,11 @@ class _Static:
     # (runtime, container id) when the cgroup path says the process lives in
     # a container; the name is looked up (and cached) by the resolver.
     container: tuple[str, str] | None = None
+    # The systemd unit / container scope owning the process, from the same
+    # cgroup read. Lets the Lag Doctor rank culprits *inside* one unit.
+    unit: str | None = None
+    # What a kernel thread does (kernel.explain), resolved once per name.
+    kernel: dict[str, object] | None = None
 
 
 class ProcessCollector:
@@ -319,6 +325,12 @@ class ProcessCollector:
             # restart; the cgroup read itself happened once, in _resolve_static.
             "container": (self.containers.entry(*static.container)
                           if static.container else None),
+            "unit": static.unit,
+            # Kernel threads: what this one *is*, so "kworker/u8:3+flush-252:0
+            # at 40%" reads as "writeback for device 252:0" and nobody tries
+            # to kill it. Only carried while it is doing something.
+            "kernel": (static.kernel if static.is_kthread
+                       and (cpu_raw / self.cores >= 0.5 or stuck) else None),
             "_io_denied": io_denied,
         }
 
@@ -351,7 +363,11 @@ class ProcessCollector:
         if not static.name:
             static.name = status.get("Name", f"pid-{pid}")
         if not static.is_kthread:
-            static.container = identify(linux.cgroup_path_of(pid))
+            cgroup = linux.cgroup_path_of(pid)
+            static.container = identify(cgroup)
+            static.unit = _unit_of_cgroup(cgroup)
+        else:
+            static.kernel = kernel_mod.explain(static.name)
         return static
 
     def _fd_count(self, pid: int) -> int | None:
@@ -437,6 +453,8 @@ class ProcessCollector:
             # its current CPU quota / IO weight and how many processes share
             # it -- what a throttle would act on, stated before it is offered.
             detail["unit"] = unit_info(pid)
+            if detail.get("is_kthread") or (not detail.get("cmdline") and not detail.get("exe")):
+                detail["kernel"] = kernel_mod.explain(str(detail.get("name") or ""))
 
             detail["parent"] = _parent_summary(proc)
             detail["children"] = _children_summary(proc)
@@ -531,6 +549,19 @@ def _derive_state(row: dict) -> str:
 def _sum_or_none(values: list) -> int | None:
     known = [int(v) for v in values if v is not None]
     return sum(known) if known else None
+
+
+def _unit_of_cgroup(path: str | None) -> str | None:
+    """Deepest .service/.scope segment of a cgroup path (same rule as
+    linux.unit_from_cgroup, without a second /proc read)."""
+    if not path:
+        return None
+    segments = [s for s in path.strip("/").split("/") if s and s != ".."]
+    for suffix in (".service", ".socket", ".scope", ".mount"):
+        for seg in reversed(segments):
+            if seg.endswith(suffix):
+                return seg
+    return None
 
 
 def _cgroup_of(pid: int) -> str | None:
