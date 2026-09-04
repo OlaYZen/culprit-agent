@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import deque
 
 from .. import linux
 from ..util import clamp
@@ -156,12 +157,19 @@ class VolumeCollector:
 
     def __init__(self) -> None:
         self._media: list[dict[str, object]] | None = None
+        # mountpoint -> (epoch, used bytes) ring for the fill forecast.
+        self._history: dict[str, deque[tuple[float, int]]] = {}
+        self._started = time.time()
 
-    def sample(self) -> dict[str, object]:
+    def sample(self, processes: list[dict] | None = None) -> dict[str, object]:
+        """`processes` (the latest process table) lets each mount name the
+        processes writing to it and the deleted files still held open."""
         volumes = []
         skipped = []
         seen_devices: set[str] = set()
-        for mount in _mounts():
+        now = time.time()
+        all_mounts = _mounts()
+        for mount in all_mounts:
             fstype, mountpoint, source, options = (
                 mount["fstype"], mount["mountpoint"], mount["source"],
                 mount["options"])
@@ -208,6 +216,30 @@ class VolumeCollector:
             })
         volumes.sort(key=lambda v: v["mountpoint"])
 
+        # Fill forecast: a least-squares slope over the last hour of samples
+        # (at least ten minutes), stated as a rate and a time to full. The
+        # ring lives in the agent, so it starts empty after a restart and
+        # says so rather than guessing from two points.
+        live = {v["mountpoint"] for v in volumes}
+        for gone in [m for m in self._history if m not in live]:
+            del self._history[gone]
+        for volume in volumes:
+            ring = self._history.setdefault(str(volume["mountpoint"]), deque())
+            ring.append((now, int(volume["used"])))
+            cutoff = now - _FORECAST_KEEP_SECONDS
+            while ring and ring[0][0] < cutoff:
+                ring.popleft()
+            volume["forecast"] = _forecast(ring, int(volume["free"]),
+                                           int(volume["total"]), now)
+
+        writers, held, gated = _writers(
+            volumes, processes or [],
+            every_mount=[str(m["mountpoint"]) for m in all_mounts])
+        for volume in volumes:
+            mount = str(volume["mountpoint"])
+            volume["writers"] = writers.get(mount, [])
+            volume["held_deleted"] = held.get(mount, [])
+
         if self._media is None:
             self._media = _block_media()
 
@@ -215,7 +247,171 @@ class VolumeCollector:
             "volumes": volumes,
             "skipped": skipped,
             "media": self._media or [],
+            "writers_gated": gated,
+            "writers_note": (
+                f"{gated} writing process(es) could not be attributed to a mount: "
+                "their open files are not readable at this privilege level "
+                "(CAP_SYS_PTRACE or root for other users' descriptors)."
+                if gated else None),
         }
+
+
+# -------------------------------------------------------------------- forecast
+_FORECAST_KEEP_SECONDS = 6 * 3600
+_FORECAST_WINDOW_SECONDS = 3600
+_FORECAST_MIN_SECONDS = 600
+_STABLE_BYTES_PER_DAY = 64 * 1024 ** 2
+
+
+def _forecast(ring: deque[tuple[float, int]], free: int, total: int,
+              now: float) -> dict[str, object]:
+    """Least-squares slope of used bytes over the recent window."""
+    window = [(t, u) for t, u in ring if t >= now - _FORECAST_WINDOW_SECONDS]
+    span = (window[-1][0] - window[0][0]) if len(window) >= 2 else 0.0
+    if span < _FORECAST_MIN_SECONDS or len(window) < 5:
+        return {"available": False,
+                "reason": f"forecasting after {_FORECAST_MIN_SECONDS // 60} min of "
+                          f"samples ({span / 60:.0f} min so far)"}
+    n = len(window)
+    t0 = window[0][0]
+    xs = [t - t0 for t, _ in window]
+    ys = [float(u) for _, u in window]
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    sxx = sum((x - mean_x) ** 2 for x in xs)
+    if sxx <= 0:
+        return {"available": False, "reason": "no time spread in the samples"}
+    sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    slope = sxy / sxx                      # bytes per second
+    syy = sum((y - mean_y) ** 2 for y in ys)
+    r2 = (sxy * sxy) / (sxx * syy) if syy > 0 else 1.0
+    per_day = slope * 86400.0
+    if abs(per_day) < _STABLE_BYTES_PER_DAY:
+        trend = "stable"
+    else:
+        trend = "growing" if slope > 0 else "shrinking"
+    seconds_to_full = (free / slope) if slope > 0 and free > 0 else None
+    return {
+        "available": True,
+        "trend": trend,
+        "rate_bytes_sec": round(slope, 1),
+        "bytes_per_day": round(per_day),
+        "seconds_to_full": (round(seconds_to_full) if seconds_to_full is not None
+                            else None),
+        "window_seconds": round(span),
+        "samples": n,
+        # How straight the line is; a burst followed by a plateau scores low
+        # and the UI says "erratic" instead of quoting an ETA to the minute.
+        "r2": round(r2, 3),
+        "delta_bytes": int(ys[-1] - ys[0]),
+    }
+
+
+# --------------------------------------------------------------------- writers
+_WRITERS_PER_MOUNT = 5
+_HELD_PER_MOUNT = 5
+
+
+def _writers(volumes: list[dict], processes: list[dict],
+             every_mount: list[str] | None = None
+             ) -> tuple[dict[str, list[dict]], dict[str, list[dict]], int]:
+    """Which processes are writing to which mount, and which deleted files
+    are still held open (the space a rotated log keeps until its holder
+    closes it). Both come from readlink over /proc/<pid>/fd, which is
+    readable for the caller's own processes only unless it has
+    CAP_SYS_PTRACE; the gated count keeps the answer honest."""
+    reported = {str(v["mountpoint"]) for v in volumes}
+    if not reported:
+        return {}, {}, 0
+    # Longest-prefix match over *every* mount (devtmpfs, proc, tmpfs too),
+    # so /dev/null or a tmpfs file is never charged to the root volume
+    # merely because "/" is a prefix of everything.
+    mounts = sorted(set(every_mount or []) | reported, key=len, reverse=True)
+
+    def mount_of(path: str) -> str | None:
+        for mount in mounts:
+            if path == mount or path.startswith(mount.rstrip("/") + "/"):
+                return mount if mount in reported else None
+        return None
+
+    writers: dict[str, list[dict]] = {}
+    held: dict[str, list[dict]] = {}
+    gated = 0
+    seen_deleted: set[tuple[int, str]] = set()
+    for proc in processes:
+        if proc.get("is_kthread"):
+            continue
+        try:
+            pid = int(proc.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        rate = float(proc.get("write_bytes_sec") or 0.0)
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            if rate > 0:
+                gated += 1
+            continue
+        paths: dict[str, list[tuple[str, bool]]] = {}
+        for fd in fds:
+            try:
+                target = os.readlink(f"{fd_dir}/{fd}")
+            except OSError:
+                continue
+            if not target.startswith("/"):
+                continue                # sockets, pipes, anon inodes
+            deleted = target.endswith(" (deleted)")
+            if deleted:
+                target = target[:-len(" (deleted)")]
+            mount = mount_of(target)
+            if mount is None:
+                continue
+            if deleted:
+                key = (pid, target)
+                if key in seen_deleted:
+                    continue
+                seen_deleted.add(key)
+                try:
+                    size = os.stat(f"{fd_dir}/{fd}").st_size
+                except OSError:
+                    size = None
+                if size and size >= 1024 ** 2:
+                    held.setdefault(mount, []).append({
+                        "pid": pid, "name": proc.get("name"),
+                        "username": proc.get("username"), "unit": proc.get("unit"),
+                        "container": proc.get("container"),
+                        "path": target, "size": size,
+                    })
+            if rate > 0:
+                entry = paths.setdefault(mount, [])
+                if len(entry) < 3 and not any(p == target for p, _ in entry):
+                    entry.append((target, deleted))
+        if rate > 0:
+            cwd_mount = None
+            try:
+                cwd_mount = mount_of(os.readlink(f"/proc/{pid}/cwd"))
+            except OSError:
+                pass
+            targets = set(paths) | ({cwd_mount} if cwd_mount and not paths else set())
+            for mount in targets:
+                writers.setdefault(mount, []).append({
+                    "pid": pid, "name": proc.get("name"),
+                    "username": proc.get("username"), "unit": proc.get("unit"),
+                    "container": proc.get("container"),
+                    "write_bytes_sec": rate,
+                    "paths": [{"path": p, "deleted": d} for p, d in paths.get(mount, [])],
+                    # True when only the working directory pointed here (no
+                    # open file did): a weaker attribution, said as such.
+                    "by_cwd": mount not in paths,
+                })
+    for mount, entries in writers.items():
+        entries.sort(key=lambda e: -float(e["write_bytes_sec"]))
+        del entries[_WRITERS_PER_MOUNT:]
+    for mount, entries in held.items():
+        entries.sort(key=lambda e: -int(e["size"] or 0))
+        del entries[_HELD_PER_MOUNT:]
+    return writers, held, gated
 
 
 # --------------------------------------------------------------------- helpers
