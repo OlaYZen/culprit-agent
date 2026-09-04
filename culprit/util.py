@@ -96,15 +96,31 @@ class Sustain:
 
     def __init__(self) -> None:
         self._streaks: dict[str, int] = {}
+        self._since: dict[str, float] = {}
 
-    def feed(self, key: str, active: bool) -> int:
+    def feed(self, key: str, active: bool, now: float | None = None) -> int:
         streak = self._streaks.get(key, 0)
         streak = streak + 1 if active else 0
         self._streaks[key] = streak
+        if streak == 1 and now is not None:
+            self._since[key] = now      # the moment the condition began
+        elif streak == 0:
+            self._since.pop(key, None)
         return streak
 
     def streak(self, key: str) -> int:
         return self._streaks.get(key, 0)
+
+    def since(self, key: str) -> float | None:
+        """Wall time the current streak started (None when not active)."""
+        return self._since.get(key)
+
+    def prune(self, prefix: str, keep: set[str]) -> None:
+        """Drop keys with `prefix` that are not in `keep` -- per-unit keys
+        would otherwise accumulate for every transient unit that ever ran."""
+        for key in [k for k in self._streaks if k.startswith(prefix) and k not in keep]:
+            del self._streaks[key]
+            self._since.pop(key, None)
 
 
 @functools.lru_cache(maxsize=1)
