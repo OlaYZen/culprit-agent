@@ -56,6 +56,7 @@ docker run -d --name culprit-agent --restart unless-stopped --pull always \
   -v /etc/machine-id:/etc/machine-id:ro \
   -v /run/systemd:/run/systemd:ro \
   -v /run/dbus:/run/dbus:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
   ghcr.io/olayzen/culprit-agent:latest
 ```
 
@@ -92,6 +93,7 @@ docker run -d --name culprit-agent --restart unless-stopped --pull always \
   -v /etc/machine-id:/etc/machine-id:ro \
   -v /run/systemd:/run/systemd:ro \
   -v /run/dbus:/run/dbus:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
   ghcr.io/olayzen/culprit-agent:latest
 ```
 
