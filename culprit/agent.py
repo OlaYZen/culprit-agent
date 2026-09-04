@@ -220,7 +220,7 @@ class Reporter:
                     return _cmd_err(cmd_id, 404, "no such process (it may have exited)")
                 return {"id": cmd_id, "ok": True, "result": detail}
 
-            if action in ("terminate", "priority"):
+            if action in ("terminate", "priority", "throttle"):
                 if not config_module.get().allow_process_actions:
                     return _cmd_err(cmd_id, 403,
                                     "process actions are disabled on this agent "
@@ -228,6 +228,12 @@ class Reporter:
                 if action == "terminate":
                     outcome = proc_mod.terminate(int(command["pid"]),
                                                  bool(command.get("force")))
+                elif action == "throttle":
+                    # Caps the process's whole systemd unit / container scope
+                    # (CPUQuota + IOWeight, --runtime) -- the reversible
+                    # verb between renice and End task.
+                    outcome = proc_mod.throttle(int(command["pid"]),
+                                                str(command.get("level")))
                 else:
                     outcome = proc_mod.set_priority(int(command["pid"]),
                                                     str(command.get("level")))
