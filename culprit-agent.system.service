@@ -4,10 +4,12 @@
 # port/process attribution: reading another user's /proc/<pid>/fd -- which is
 # what maps a listening port to its process -- needs root or CAP_SYS_PTRACE.
 #
-# Install (adjust the path if your bundle isn't at /opt/culprit-agent):
+# `sudo ./agent.sh` writes and enables an equivalent of this unit with the
+# folder's real path; this file is the manual alternative (adjust the path if
+# your bundle isn't at /opt/culprit-agent):
 #   sudo cp -r culprit-agent /opt/culprit-agent
 #   cd /opt/culprit-agent
-#   sudo ./agent.sh <host-url> <token>      # first run: builds .venv, writes agent.json (root-owned, chmod 600)
+#   sudo ./agent.sh --configure             # builds .venv, asks for host + token, writes agent.json (root-owned, chmod 600)
 #   sudo cp culprit-agent.system.service /etc/systemd/system/culprit-agent.service
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now culprit-agent
