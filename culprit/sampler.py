@@ -36,6 +36,9 @@ from .collectors import network as net_mod
 from .collectors import ports as ports_mod
 from .collectors import processes as proc_mod
 from .collectors import services as svc_mod
+from .collectors import cgroups as cgroups_mod
+from .collectors import kernel as kernel_mod
+from .collectors.changes import ChangeLog
 from .collectors import sync as sync_mod
 from .collectors import sysinfo as sysinfo_mod
 from .collectors.cpu_mem import CpuMemoryCollector
@@ -97,6 +100,12 @@ class Sampler:
         self.ports: ports_mod.PortsCollector | None = None
         self.sync: sync_mod.SyncCollector | None = None
         self.events: events_mod.EventCollector | None = None
+        # Per-unit pressure/limits and the kernel's own state ride on the
+        # proc tick (cheap, and the Lag Doctor reads them). The change log is
+        # fed by every tier and read by the doctor.
+        self.cgroups: cgroups_mod.CgroupCollector | None = None
+        self.kernel: kernel_mod.KernelCollector | None = None
+        self.changes: ChangeLog | None = None
 
         # Rollup accumulation.
         self._bucket_ts: int | None = None
@@ -115,6 +124,7 @@ class Sampler:
             self._executors["slow"], sysinfo_mod.collect
         )
         self.store.put("system", sysinfo)
+        self.changes = ChangeLog(boot_time=(sysinfo or {}).get("boot_time"))
 
         # Build the fast-tier collectors before announcing readiness; the GPU
         # wildcard enumeration is the slow part and belongs in warm-up.
@@ -274,9 +284,20 @@ class Sampler:
 
         self.lag.score_processes(processes, snapshot, pressures, cfg)
 
+        if self.cgroups is None:
+            self.cgroups = cgroups_mod.CgroupCollector()
+        if self.kernel is None:
+            self.kernel = kernel_mod.KernelCollector()
+        cgroups = self.cgroups.sample(containers=self.proc.containers)
+        kernel = self.kernel.sample()
+        if self.changes is not None:
+            self.changes.observe_processes(processes)
+            self.changes.observe_cgroups(cgroups)
+
         volumes = (self.store.get("volumes") or {}).get("volumes") or []
         diagnosis = self.lag.diagnose(snapshot, processes, pressures, cfg,
-                                      volumes=volumes)
+                                      volumes=volumes, cgroups=cgroups,
+                                      kernel=kernel, changes=self.changes)
 
         # Annotate unit main processes with the units they belong to.
         service_map = (self.store.get("services") or {}).get("by_pid") or {}
@@ -313,8 +334,12 @@ class Sampler:
         }
         self.store.put("process_table", payload)
         self.store.put("diagnosis", diagnosis)
+        self.store.put("cgroups", cgroups)
+        self.store.put("kernel", kernel)
         self.broker.publish("proc", payload)
         self.broker.publish("diagnosis", diagnosis)
+        self.broker.publish("cgroups", cgroups)
+        self.broker.publish("kernel", kernel)
 
     # -------------------------------------------------------------- slow tick
     def _tick_slow(self) -> None:
@@ -348,6 +373,14 @@ class Sampler:
             "network_detail": net_detail, "ports": ports, "sync": sync,
             "system": system, "ts": time.time(),
         }
+        if self.changes is not None:
+            # Diff against the previous slow tick; the log itself is what
+            # the Lag Doctor asks "what changed before this began?".
+            self.changes.observe_services(services)
+            self.changes.observe_volumes(volumes)
+            self.changes.observe_ports(ports)
+            self.changes.observe_network(net_detail)
+            payload["changes"] = self.changes.snapshot()
         self.store.merge(payload)
         self.broker.publish("slow", payload)
 
@@ -361,6 +394,8 @@ class Sampler:
             max_per_source=cfg.event_max_per_source,
         )
         self.store.put("events", payload)
+        if self.changes is not None:
+            self.changes.observe_events(payload)
 
         if self.history.ready:
             everything = (
