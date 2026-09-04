@@ -30,6 +30,8 @@ and the UI says so instead of quietly omitting it.
 
 from __future__ import annotations
 
+import time
+
 from ..config import Config
 from ..util import Sustain, clamp, safe_div
 
@@ -171,8 +173,13 @@ class LagAnalyzer:
                 # *symptom* of memory pressure caused by someone else.
                 proc["lag_score"] = 0.0
                 proc["lag_breakdown"] = {}
-                proc["lag_reasons"] = (["kernel thread"]
-                                       if float(proc.get("cpu") or 0) > 0.5 else [])
+                # Say what the thread *is* ("writeback for device 252:0")
+                # rather than the bare fact that it is a kernel thread.
+                explained = proc.get("kernel") or {}
+                proc["lag_reasons"] = (
+                    [f"kernel: {explained['role']}"] if explained.get("role")
+                    else ["kernel thread"] if float(proc.get("cpu") or 0) > 0.5
+                    else [])
                 continue
 
             # Blend instantaneous with the rolling mean: sustained load should
@@ -217,26 +224,43 @@ class LagAnalyzer:
     # ------------------------------------------------------------- verdicts
     def diagnose(self, snapshot: dict, processes: list[dict],
                  pressures: dict[str, float], cfg: Config,
-                 volumes: list[dict] | None = None) -> dict[str, object]:
-        """Build the sustained-pressure findings and attribute them to processes."""
+                 volumes: list[dict] | None = None,
+                 cgroups: dict | None = None, kernel: dict | None = None,
+                 changes: object = None) -> dict[str, object]:
+        """Build the sustained-pressure findings and attribute them to processes.
+
+        `cgroups` (per-unit pressure and limits), `kernel` (mdstat, per-core
+        interrupts) and `changes` (a ChangeLog) are optional: without them the
+        machine-level findings are exactly what they were.
+        """
         cpu = snapshot.get("cpu") or {}
         memory = snapshot.get("memory") or {}
         disk_total = (snapshot.get("disk") or {}).get("total") or {}
         gpu = snapshot.get("gpu") or {}
         psi = snapshot.get("psi") or {}
+        now = time.time()
 
         candidates: list[dict[str, object]] = []
 
         def consider(key: str, active: bool, severity: str, title: str,
                      detail: str, resource: str, evidence: dict[str, object],
-                     blame: str | None = None) -> None:
-            streak = self._sustain.feed(key, active)
+                     blame: str | None = None,
+                     unit: dict[str, object] | None = None) -> None:
+            streak = self._sustain.feed(key, active, now)
             if active and streak >= cfg.sustain_ticks:
                 finding: dict[str, object] = {
                     "key": key, "severity": severity, "title": title,
                     "detail": detail, "resource": resource,
                     "evidence": evidence, "sustained_ticks": streak,
+                    # When the condition began (first sample of the streak),
+                    # so the UI can say "since 14:02" and the change log can
+                    # be asked what happened just before.
+                    "since": self._sustain.since(key),
                 }
+                if unit:
+                    # The finding is about one unit / container; culprits
+                    # are ranked among *its* processes only.
+                    finding["unit"] = unit
                 if blame:
                     # "Nobody on this machine is at fault": the cause is
                     # outside the process table (hypervisor, cooling, the
@@ -389,10 +413,17 @@ class LagAnalyzer:
                 blame="the swap device (a rotational disk), not a process",
             )
 
+        # --- Inside one unit: what the machine-wide numbers hide -----------
+        unit_oom = self._unit_findings(cgroups, consider, candidates, cfg, now,
+                                       psi_cpu, psi_mem_full, psi_io_full)
+
         # OOM kills: an event, not a level, so it bypasses the sustain window.
+        # When a unit's own counter explains it, that finding names the unit
+        # and this machine-wide one stays quiet (same kill, counted twice).
         oom_total = memory.get("oom_kills_total")
         if isinstance(oom_total, int):
-            if self._prev_oom is not None and oom_total > self._prev_oom:
+            if self._prev_oom is not None and oom_total > self._prev_oom \
+                    and not unit_oom:
                 candidates.append({
                     "key": "oom_kill", "severity": "critical",
                     "title": "The kernel killed a process (OOM)",
@@ -401,9 +432,13 @@ class LagAnalyzer:
                               "last sample. See the Events view for which.",
                     "resource": "memory",
                     "evidence": {"oom_kills_total": oom_total},
-                    "sustained_ticks": cfg.sustain_ticks,
+                    "sustained_ticks": cfg.sustain_ticks, "since": now,
                 })
             self._prev_oom = oom_total
+
+        # --- The kernel itself: RAID rebuilds, interrupt-bound cores, disk
+        # encryption, a device being reset -- causes with no process behind them
+        self._kernel_findings(kernel, processes, pressures, consider, cfg)
 
         # --- Disk ----------------------------------------------------------
         latency_ms = disk_total.get("latency_ms")
@@ -517,11 +552,29 @@ class LagAnalyzer:
         # Attribute each finding to the processes actually driving that resource.
         # An external finding lists no culprits -- unless the listed processes
         # are its *victims* (D-state), which the finding then says outright.
+        # A per-unit finding ranks only the processes inside that unit.
         for finding in candidates:
             if finding.get("external") and not finding.get("victims"):
                 finding["culprits"] = []
+            elif finding.get("unit"):
+                unit_name = (finding["unit"] or {}).get("name")  # type: ignore[union-attr]
+                inside = [p for p in processes if p.get("unit") == unit_name]
+                finding["culprits"] = (_culprits(inside, str(finding["resource"]))
+                                       if inside else [])
             else:
                 finding["culprits"] = _culprits(processes, str(finding["resource"]))
+            # Which units are hurting most under a machine-wide stall: the
+            # victims' side of the same measurement, from their own cgroups.
+            if str(finding["key"]) in ("psi_cpu", "psi_memory", "psi_io"):
+                finding["suffering"] = _suffering(cgroups, str(finding["key"]))
+            # What changed in the minutes before it began -- coincidence,
+            # labelled as such; the reader draws the line.
+            since = finding.get("since")
+            if changes is not None and isinstance(since, (int, float)):
+                try:
+                    finding["changes"] = changes.around(float(since))  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 -- never let the log break a diagnosis
+                    finding["changes"] = []
 
         candidates.sort(key=lambda f: (
             -SEVERITY_ORDER.index(str(f["severity"])),
@@ -542,7 +595,348 @@ class LagAnalyzer:
         }
 
 
+    # ----------------------------------------------------------- per unit
+    def _unit_findings(self, cgroups: dict | None, consider, candidates: list,
+                       cfg: Config, now: float, machine_cpu: float | None,
+                       machine_mem: float | None, machine_io: float | None) -> bool:
+        """Throttled by its own quota, at its own memory limit, or stalled
+        inside while the machine is quiet. Returns True when a unit-confined
+        OOM kill was reported (so the machine-wide one is not repeated)."""
+        keys: set[str] = set()
+        unit_oom = False
+        units = (cgroups or {}).get("units") if isinstance(cgroups, dict) \
+            and cgroups.get("available") else None
+        for unit in units or []:
+            if not isinstance(unit, dict):
+                continue
+            cgroup = str(unit.get("cgroup") or "")
+            label = _unit_label(unit)
+            ref = {
+                "name": unit.get("unit"), "cgroup": cgroup,
+                "manager": unit.get("manager"), "kind": unit.get("kind"),
+                "container": unit.get("container"),
+                "runtime_cap": bool(unit.get("runtime_cap")),
+            }
+            psi_unit = unit.get("psi") or {}
+            quota = unit.get("cpu_quota_pct")
+
+            # 1. Hitting its CPU quota: slow because of a cap, not the box.
+            key = f"unit_throttled:{cgroup}"
+            keys.add(key)
+            throttled = unit.get("throttled_pct")
+            if quota is not None and isinstance(throttled, (int, float)):
+                machine_pct = unit.get("cpu_quota_machine_pct")
+                cap = (f"{float(quota):.0f}% of one core"
+                       + (f" ({float(machine_pct):.0f}% of this machine)"
+                          if isinstance(machine_pct, (int, float)) else ""))
+                if unit.get("runtime_cap"):
+                    origin = (" The cap was set at runtime (a `systemctl "
+                              "set-property --runtime` drop-in, which is what "
+                              "Culprit's Throttle creates) and lasts until the "
+                              "unit is released or the machine reboots: if "
+                              "nobody meant to keep it, release it from the "
+                              "process dialog.")
+                else:
+                    origin = (" The cap comes from the unit's own configuration "
+                              "(CPUQuota=, or the container's --cpus); raise it "
+                              "there if the work matters.")
+                consider(
+                    key, float(throttled) >= 25.0,
+                    "critical" if float(throttled) >= 75.0 else "warn",
+                    f"{label} is hitting its CPU quota",
+                    f"The unit wanted more CPU than its cap allows in "
+                    f"{float(throttled):.0f}% of scheduling periods "
+                    f"({float(unit.get('throttled_ms_sec') or 0):.0f} ms/s "
+                    f"spent throttled). Its cap is {cap}. Everything in it "
+                    "runs slower because of the cap, not because the machine "
+                    "is busy." + origin,
+                    "cpu", {"throttled_pct": round(float(throttled), 1),
+                            "cpu_quota_pct": quota,
+                            "throttled": f"{float(unit.get('throttled_ms_sec') or 0):.0f} ms/s",
+                            "processes": unit.get("pids")},
+                    unit=ref)
+
+            # 2. At its memory limit: the box has RAM, the unit does not.
+            key = f"unit_memlimit:{cgroup}"
+            keys.add(key)
+            mem_max = unit.get("memory_max")
+            pct = unit.get("memory_limit_pct")
+            hits = (float(unit.get("limit_hits_sec") or 0)
+                    + float(unit.get("high_hits_sec") or 0))
+            if isinstance(mem_max, int) and mem_max > 0:
+                stall = psi_unit.get("memory_full")
+                active = (isinstance(pct, (int, float)) and float(pct) >= 95.0) or hits > 0
+                consider(
+                    key, bool(active),
+                    "critical" if (isinstance(pct, (int, float)) and float(pct) >= 99.0)
+                    or (isinstance(stall, (int, float)) and float(stall) >= cfg.psi_memory_high)
+                    else "warn",
+                    f"{label} is at its memory limit",
+                    f"Using {_mb(unit.get('memory_bytes'))} of its {_mb(mem_max)} "
+                    f"limit"
+                    + (f" ({float(pct):.0f}%)" if isinstance(pct, (int, float)) else "")
+                    + (f"; the kernel hit that limit {hits:.1f} times/s and is "
+                       "reclaiming inside the unit" if hits > 0 else "")
+                    + (f", and its tasks were stalled on memory {float(stall):.0f}% "
+                       "of the time" if isinstance(stall, (int, float)) and stall >= 1 else "")
+                    + ". This is the unit's own ceiling (memory.max, or the "
+                    "container's --memory), not the machine running out of RAM. "
+                    "What comes next is an OOM kill confined to the unit.",
+                    "memory", {"memory_limit_pct": pct,
+                               "limit_mb": round(mem_max / 1024 ** 2),
+                               "used_mb": round(float(unit.get("memory_bytes") or 0) / 1024 ** 2),
+                               "limit_hits_sec": round(hits, 2),
+                               "unit_stall_pct": stall},
+                    unit=ref)
+
+            # 2b. An OOM kill confined to the unit: an event, no sustain.
+            new_kills = int(unit.get("oom_kills_new") or 0)
+            if new_kills > 0:
+                unit_oom = True
+                candidates.append({
+                    "key": f"unit_oom:{cgroup}", "severity": "critical",
+                    "title": f"The kernel killed a process inside {label}",
+                    "detail": f"{new_kills} process(es) in this unit were killed "
+                              "for exceeding the unit's own memory limit"
+                              + (f" ({_mb(mem_max)})" if isinstance(mem_max, int) else "")
+                              + ". The machine as a whole was not out of memory; "
+                              "the unit was. See the Events view for which process.",
+                    "resource": "memory", "unit": ref,
+                    "evidence": {"oom_kills": unit.get("oom_kills"),
+                                 "limit_mb": (round(mem_max / 1024 ** 2)
+                                              if isinstance(mem_max, int) else None)},
+                    "sustained_ticks": cfg.sustain_ticks, "since": now,
+                })
+
+            # 3. Stalled inside while the machine is quiet.
+            for resource, kind, machine, threshold, word, hint in (
+                ("cpu", "some", machine_cpu, cfg.psi_cpu_high, "CPU",
+                 (f"It has a CPU quota of {float(quota):.0f}% of one core -- "
+                  "see whether it is being throttled." if quota is not None else
+                  "Its threads compete with each other for the CPU share this "
+                  "unit is allowed (cpu.weight, cpuset), or it wants more cores "
+                  "than it can reach.")),
+                ("memory", "full", machine_mem, cfg.psi_memory_high / 2, "memory",
+                 ("Reclaim is happening inside the unit: it is near its own "
+                  "memory limit." if isinstance(mem_max, int) else
+                  "Reclaim is happening inside the unit (memory.high, or its "
+                  "own working set thrashing).")),
+                ("io", "full", machine_io, cfg.psi_io_high / 2, "storage",
+                 "Its IO is slower than the machine's average: it may sit on a "
+                 "slower device (a network mount, a USB disk, a loop image) or "
+                 "be limited by io.max / io.weight."),
+            ):
+                key = f"unit_stalled:{resource}:{cgroup}"
+                keys.add(key)
+                value = psi_unit.get(f"{resource}_{kind}")
+                if not isinstance(value, (int, float)):
+                    continue
+                machine_val = float(machine or 0.0)
+                active = float(value) >= threshold and machine_val < float(value) / 2
+                consider(
+                    key, active,
+                    "critical" if float(value) >= threshold * 2 else "warn",
+                    f"{label} is stalled on {word}",
+                    f"Tasks in this unit were stalled waiting for {word} "
+                    f"{float(value):.0f}% of the time (10 s average) while the "
+                    f"machine as a whole was at {machine_val:.0f}%: the problem "
+                    "is inside the unit, not the box. " + hint,
+                    {"cpu": "cpu", "memory": "memory", "io": "disk"}[resource],
+                    {"unit_stall_pct": round(float(value), 1),
+                     "machine_stall_pct": round(machine_val, 1)},
+                    unit=ref)
+        self._sustain.prune("unit_", keys)
+        # A parent (user@1000.service, a slice-like manager) aggregates its
+        # children's stall; when a child already carries a finding, the
+        # parent's "stalled" is the same fact one level up -- drop it.
+        carrying = [str((c.get("unit") or {}).get("cgroup") or "")
+                    for c in candidates if c.get("unit")]
+        candidates[:] = [
+            c for c in candidates
+            if not (str(c.get("key", "")).startswith("unit_stalled:")
+                    and any(other != (c.get("unit") or {}).get("cgroup")
+                            and other.startswith(str((c.get("unit") or {}).get("cgroup")) + "/")
+                            for other in carrying))
+        ]
+        # Machine-wide CPU stall counts throttled tasks as stalled; when
+        # units are hitting their quota, say how much of the machine's
+        # number is that, instead of letting it read as a saturated box.
+        throttled = [str((c.get("unit") or {}).get("name") or "?") for c in candidates
+                     if str(c.get("key", "")).startswith("unit_throttled:")]
+        if throttled:
+            for finding in candidates:
+                if finding.get("key") == "psi_cpu":
+                    finding["detail"] = (
+                        str(finding["detail"]) + " Part of this stall is quota "
+                        f"throttling inside {', '.join(throttled[:3])}: tasks "
+                        "waiting on their own cgroup's CPU cap count as stalled, "
+                        "so this can read as a saturated machine while the cores "
+                        "sit idle -- check the per-unit findings first.")
+                    finding.setdefault("evidence", {})["throttled_units"] = ", ".join(throttled[:3])
+        return unit_oom
+
+    # ----------------------------------------------------------- the kernel
+    def _kernel_findings(self, kernel: dict | None, processes: list[dict],
+                         pressures: dict[str, float], consider, cfg: Config) -> None:
+        kn = kernel if isinstance(kernel, dict) and kernel.get("available") else {}
+        md = kn.get("mdstat") or {}
+        arrays = md.get("arrays") if isinstance(md, dict) else None
+        keys: set[str] = set()
+        for array in arrays or []:
+            if not isinstance(array, dict):
+                continue
+            name = str(array.get("name"))
+            sync = array.get("sync")
+            key = f"raid_sync:{name}"
+            keys.add(key)
+            if isinstance(sync, dict):
+                op = str(sync.get("op"))
+                pct = float(sync.get("percent") or 0)
+                finish = sync.get("finish_minutes")
+                speed = sync.get("speed_kb_sec")
+                eta = (f", about {_minutes_text(float(finish))} left"
+                       if isinstance(finish, (int, float)) else "")
+                rate = (f" at {float(speed) / 1024:.0f} MB/s"
+                        if isinstance(speed, (int, float)) else "")
+                consider(
+                    key, True,
+                    "warn" if float(pressures.get("disk") or 0) >= 0.5 else "info",
+                    f"RAID {op} running on {name} ({pct:.0f}%)",
+                    f"The software-RAID array {name} ({array.get('level')}) is in "
+                    f"a {op}{rate}{eta}. It reads and writes every member disk "
+                    f"({', '.join(str(m) for m in array.get('members') or [])}) "
+                    "until it finishes, and competes with everything else "
+                    "using those disks. No process caused it; "
+                    "/proc/sys/dev/raid/speed_limit_max slows it down if the "
+                    "foreground work matters more.",
+                    "disk", {"array": name, "operation": op, "percent": pct,
+                             "finish_minutes": finish, "speed_kb_sec": speed},
+                    blame=f"the RAID {op} on {name}, not a process")
+            else:
+                consider(key, False, "info", "", "", "disk", {})
+            key = f"raid_degraded:{name}"
+            keys.add(key)
+            consider(
+                key, bool(array.get("degraded")) and not isinstance(sync, dict),
+                "critical", f"RAID array {name} is degraded",
+                f"{name} ({array.get('level')}) is running with "
+                f"{array.get('members_active')} of {array.get('members_expected')} "
+                "members and no rebuild in progress. One more disk failure "
+                "loses the array. Replace the failed member and add it back "
+                "(mdadm --add) so a recovery starts.",
+                "disk", {"array": name, "members_active": array.get("members_active"),
+                         "members_expected": array.get("members_expected"),
+                         "failed_members": array.get("failed_members")},
+                blame=f"a failed member disk of {name}, not a process")
+        self._sustain.prune("raid_", keys)
+
+        cores = {int(c.get("core")): c for c in ((kn.get("irq") or {}).get("cores") or [])
+                 if isinstance(c, dict) and isinstance(c.get("core"), int)}
+        crypt_cpu = 0.0
+        eh_active: list[str] = []
+        soft_keys: set[str] = set()
+        for proc in processes:
+            if not proc.get("is_kthread"):
+                continue
+            name = str(proc.get("name") or "")
+            cpu_raw = float(proc.get("cpu_raw") or 0.0)
+            if name.startswith("ksoftirqd/"):
+                try:
+                    core = int(name.split("/", 1)[1])
+                except ValueError:
+                    continue
+                key = f"softirq_core:{core}"
+                soft_keys.add(key)
+                info = cores.get(core) or {}
+                top = (info.get("top") or [None])[0]
+                soft = info.get("softirq") or {}
+                device = (f"irq {top['irq']} ({top['name']}, {top['rate']:,}/s)"
+                          if isinstance(top, dict) else "no single device stands out")
+                which = (f"{soft.get('name')} softirqs" if soft.get("name")
+                         else "softirqs")
+                consider(
+                    key, cpu_raw >= 30.0,
+                    "critical" if cpu_raw >= 70.0 else "warn",
+                    f"Core {core} is busy servicing interrupts",
+                    f"ksoftirqd/{core} used {cpu_raw:.0f}% of core {core} draining "
+                    f"{which}; the busiest interrupt on that core is {device}. "
+                    "Interrupt work is not a process: it cannot be reniced or "
+                    "killed, and the tasks scheduled on that core are what "
+                    "stall. Spread it with irqbalance, the device's RSS/RPS "
+                    "queues, or by moving that IRQ's affinity to another core.",
+                    "cpu", {"core": core, "ksoftirqd_pct": round(cpu_raw, 1),
+                            "softirq": soft.get("name"),
+                            "irq": top.get("irq") if isinstance(top, dict) else None,
+                            "irq_device": top.get("name") if isinstance(top, dict) else None,
+                            "irq_rate_sec": top.get("rate") if isinstance(top, dict) else None},
+                    blame=f"interrupt handling on core {core}"
+                          + (f" for {top['name']}" if isinstance(top, dict) else "")
+                          + ", not a process")
+            elif name.startswith(("kcryptd", "dmcrypt_write")):
+                crypt_cpu += cpu_raw
+            elif name.startswith("scsi_eh_") and (cpu_raw >= 1.0 or proc.get("stuck")):
+                eh_active.append(name)
+        self._sustain.prune("softirq_", soft_keys)
+        consider(
+            "dmcrypt_cpu", crypt_cpu >= 50.0,
+            "warn", "Disk encryption is consuming CPU",
+            f"The dm-crypt threads (kcryptd, dmcrypt_write) used {crypt_cpu:.0f}% "
+            "of a core: every block read from or written to an encrypted "
+            "volume is encrypted here, charged to the kernel rather than to "
+            "the process doing the IO. The processes below are the ones "
+            "generating that IO. AES-NI (cpuinfo flag `aes`) makes this several "
+            "times cheaper if it is not already in use.",
+            "disk", {"dmcrypt_cpu_pct": round(crypt_cpu, 1)})
+        consider(
+            "scsi_recovery", bool(eh_active), "critical",
+            "A storage device is being reset by the SCSI error handler",
+            f"{', '.join(sorted(eh_active))} became active: the SCSI layer is "
+            "aborting commands and resetting a device that stopped answering. "
+            "Everything queued on that device waits meanwhile. This is a disk, "
+            "controller or cable problem -- dmesg / the Events view names the "
+            "device (I/O error, task abort, reset), and its SMART data is the "
+            "next thing to read.",
+            "disk", {"handlers": ", ".join(sorted(eh_active)) or None},
+            blame="a storage device that stopped answering, not a process")
+
+
 # --------------------------------------------------------------------- helpers
+def _unit_label(unit: dict) -> str:
+    """'nginx.service', or the container's name when the unit is one."""
+    where = unit.get("container")
+    if isinstance(where, dict):
+        if where.get("name"):
+            return f"container {where['name']}"
+        if where.get("id"):
+            return f"container {str(where['id'])[:12]}"
+    return str(unit.get("unit") or unit.get("cgroup") or "unit")
+
+
+def _suffering(cgroups: dict | None, key: str) -> list[dict[str, object]]:
+    """Units stalled hardest under a machine-wide stall: the victims' view."""
+    if not isinstance(cgroups, dict) or not cgroups.get("available"):
+        return []
+    field = {"psi_cpu": "cpu_some", "psi_memory": "memory_full",
+             "psi_io": "io_full"}[key]
+    ranked = []
+    for unit in cgroups.get("units") or []:
+        if not isinstance(unit, dict):
+            continue
+        value = (unit.get("psi") or {}).get(field)
+        if isinstance(value, (int, float)) and value >= 5.0:
+            ranked.append((float(value), unit))
+    ranked.sort(key=lambda item: -item[0])
+    return [{"name": _unit_label(unit), "unit": unit.get("unit"),
+             "stall_pct": round(value, 1), "container": unit.get("container")}
+            for value, unit in ranked[:3]]
+
+
+def _minutes_text(minutes: float) -> str:
+    if minutes >= 90:
+        return f"{minutes / 60:.1f} h"
+    return f"{minutes:.0f} min"
+
+
 def _ratio(value: object, threshold: float) -> float:
     """How far `value` has gone toward `threshold`, capped at 1.0."""
     if value is None or threshold <= 0:
@@ -725,6 +1119,7 @@ def _slim(proc: dict) -> dict[str, object]:
             "write_bytes_sec", "gpu", "vram", "threads", "page_faults_sec",
             "major_faults_sec", "run_delay_ms", "state", "stuck", "wchan",
             "lag_score", "lag_breakdown", "lag_reasons", "exe", "container",
+            "unit", "kernel",
         )
     }
 

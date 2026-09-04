@@ -31,7 +31,7 @@ from typing import Any, Iterable, Sequence
 
 log = logging.getLogger("culprit.db")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # The host machine's own data is node 'local'; agent nodes use their enrolled
 # name. Kept as a plain column (not a separate DB per node) so cross-node
@@ -115,6 +115,27 @@ CREATE TABLE IF NOT EXISTS findings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_findings_ts ON findings(ts);
+
+-- The change log: unit starts/stops, timers fired, mounts, listeners, logins,
+-- package upgrades, quota changes -- facts with a time, per node. Agents keep
+-- a ring in memory and resend the section when it changes; the host keeps
+-- everything it sees so "what changed before this incident" survives an
+-- agent restart. `uid` is the agent's own id (ts:kind:subject).
+CREATE TABLE IF NOT EXISTS changes (
+    node      TEXT NOT NULL DEFAULT 'local',
+    uid       TEXT NOT NULL,
+    ts        REAL NOT NULL,
+    kind      TEXT,
+    source    TEXT,
+    title     TEXT,
+    detail    TEXT,
+    subject   TEXT,
+    severity  TEXT,
+    exact     INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (node, uid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_changes_ts ON changes(ts);
 
 -- Expected-busy annotations: "this finding, on this node (or all), led by
 -- this culprit (or any), is normal -- here is why, and during this window".
@@ -369,6 +390,7 @@ class History:
                 conn.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
                 conn.execute("DELETE FROM proc_samples WHERE ts < ?", (cutoff,))
                 conn.execute("DELETE FROM findings WHERE ts < ?", (cutoff,))
+                conn.execute("DELETE FROM changes WHERE ts < ?", (cutoff,))
                 conn.execute("DELETE FROM actions WHERE ts < ?",
                              (now - max(retention_days, 90) * 86_400,))
                 # Events are kept longer -- a bluescreen from six weeks ago is
@@ -553,12 +575,78 @@ class History:
         if incidents:
             earliest = min(i["start"] for i in incidents)
             actions = self.actions(earliest - bucket_seconds, node=node, limit=500)
+            # Findings are written once per bucket, so an incident's `start`
+            # is up to one bucket late; look back a bucket plus ten minutes.
+            lead = 600.0 + bucket_seconds
+            changes = self.changes(earliest - lead, node=node, limit=2000)
             for incident in incidents:
                 incident["actions"] = [
                     a for a in actions
                     if incident["start"] - bucket_seconds <= float(a["ts"]) <= incident["end"]
                 ]
+                window = [
+                    c for c in changes
+                    if incident["start"] - lead <= float(c["ts"]) <= incident["start"] + 30
+                ]
+                for change in window:
+                    change["offset_seconds"] = round(float(change["ts"]) - incident["start"])
+                incident["changes"] = window[:8]
         return incidents
+
+    # ------------------------------------------------------------------ changes
+    def write_changes(self, events: Iterable[dict[str, Any]],
+                      node: str = LOCAL_NODE) -> int:
+        """Insert change-log entries, ignoring ones already stored."""
+        if not self.ready or not self.recording:
+            return 0
+        rows = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            ts = _f(event.get("ts"))
+            uid = event.get("id")
+            if not ts or not math.isfinite(ts) or not isinstance(uid, str):
+                continue
+            rows.append((
+                node, uid[:200], ts, _text(event.get("kind"), 64),
+                _text(event.get("source"), 64), _text(event.get("title"), 300),
+                _text(event.get("detail"), 1000) if event.get("detail") is not None else None,
+                _text(event.get("subject"), 200), _text(event.get("severity"), 16),
+                0 if event.get("exact") is False else 1,
+            ))
+        if not rows:
+            return 0
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return 0
+            cur = conn.executemany(
+                "INSERT OR IGNORE INTO changes (node, uid, ts, kind, source, title, "
+                "detail, subject, severity, exact) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows)
+            conn.commit()
+            return int(cur.rowcount or 0)
+
+    def changes(self, since: float, until: float | None = None,
+                node: str = LOCAL_NODE, limit: int = 500) -> list[dict[str, Any]]:
+        """Stored change-log entries for one node, newest first."""
+        if not self.ready:
+            return []
+        clauses, params = ["node = ?", "ts >= ?"], [node, since]
+        if until is not None:
+            clauses.append("ts <= ?")
+            params.append(until)
+        params.append(limit)
+        rows = self._query(
+            f"SELECT uid AS id, ts, kind, source, title, detail, subject, severity, "
+            f"exact FROM changes WHERE {' AND '.join(clauses)} ORDER BY ts DESC LIMIT ?",
+            tuple(params))
+        out = []
+        for row in rows:
+            entry = dict(row)
+            entry["exact"] = bool(entry.get("exact"))
+            out.append(entry)
+        return out
 
     # ------------------------------------------------------------ expectations
     def list_expectations(self) -> list[dict[str, Any]]:
@@ -843,6 +931,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         return
 
     log.info("migrating history database v%s -> v%s", version, SCHEMA_VERSION)
+    if version >= 2:
+        # v2 -> v3 only adds tables; CREATE IF NOT EXISTS is the whole job.
+        conn.executescript(_SCHEMA)
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
+                     "('schema_version', ?)", (str(SCHEMA_VERSION),))
+        conn.commit()
+        return
     old_sample_cols = ", ".join(_SAMPLE_COLUMNS)
     conn.executescript("""
         BEGIN;
