@@ -683,6 +683,45 @@ class History:
                              (expectation_id,)) > 0
 
     # ------------------------------------------------------------------ actions
+    def action_record(self, node: str, name: str | None,
+                      unit: str | None = None, days: int = 90) -> dict[str, Any]:
+        """What happened the last times this process (or its unit) was acted
+        on: per action, how many tries and how each was judged. The verdict
+        store is the memory; nothing is inferred beyond counting."""
+        if not self.ready or not (name or unit):
+            return {"record": {}, "total": 0}
+        clauses, params = ["node = ?", "ts >= ?"], [node, time.time() - days * 86400]
+        alts = []
+        if name:
+            alts.append("name = ?")
+            params.append(name)
+        if unit:
+            alts.append("unit = ?")
+            params.append(unit)
+        clauses.append("(" + " OR ".join(alts) + ")")
+        rows = self._query(
+            f"SELECT ts, action, name, unit, verdict FROM actions "
+            f"WHERE {' AND '.join(clauses)} ORDER BY ts DESC LIMIT 200", tuple(params))
+        record: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            action = str(row["action"])
+            try:
+                verdict = json.loads(row["verdict"]) if row["verdict"] else None
+            except ValueError:
+                verdict = None
+            outcome = str(verdict.get("outcome")) if isinstance(verdict, dict) else "pending"
+            entry = record.setdefault(action, {
+                "tries": 0, "outcomes": {}, "last_ts": None, "last_outcome": None,
+                "last_text": None, "same_unit": bool(unit and row["unit"] == unit),
+            })
+            entry["tries"] += 1
+            entry["outcomes"][outcome] = entry["outcomes"].get(outcome, 0) + 1
+            if entry["last_ts"] is None:
+                entry["last_ts"] = float(row["ts"])
+                entry["last_outcome"] = outcome
+                entry["last_text"] = (verdict.get("text") if isinstance(verdict, dict) else None)
+        return {"record": record, "total": len(rows)}
+
     def record_action(self, node: str, action: str, pid: int | None,
                       name: str | None, unit: str | None, detail: dict[str, Any],
                       username: str | None) -> int:

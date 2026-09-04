@@ -54,6 +54,7 @@ class LagAnalyzer:
     def __init__(self) -> None:
         self._sustain = Sustain()
         self._prev_oom: int | None = None
+        self._last_candidates: list[dict[str, object]] = []
 
     # ------------------------------------------------------------- pressure
     def pressures(self, snapshot: dict, cfg: Config) -> dict[str, float]:
@@ -226,7 +227,8 @@ class LagAnalyzer:
                  pressures: dict[str, float], cfg: Config,
                  volumes: list[dict] | None = None,
                  cgroups: dict | None = None, kernel: dict | None = None,
-                 changes: object = None) -> dict[str, object]:
+                 changes: object = None,
+                 ceilings: dict | None = None) -> dict[str, object]:
         """Build the sustained-pressure findings and attribute them to processes.
 
         `cgroups` (per-unit pressure and limits), `kernel` (mdstat, per-core
@@ -241,6 +243,7 @@ class LagAnalyzer:
         now = time.time()
 
         candidates: list[dict[str, object]] = []
+        self._last_candidates = candidates
 
         def consider(key: str, active: bool, severity: str, title: str,
                      detail: str, resource: str, evidence: dict[str, object],
@@ -440,6 +443,9 @@ class LagAnalyzer:
         # encryption, a device being reset -- causes with no process behind them
         self._kernel_findings(kernel, processes, pressures, consider, cfg)
 
+        # --- Ceilings: a hard limit about to be reached, with its holder ----
+        self._ceiling_findings(ceilings, cgroups, consider, cfg)
+
         # --- Disk ----------------------------------------------------------
         latency_ms = disk_total.get("latency_ms")
         if latency_ms is not None:
@@ -492,22 +498,75 @@ class LagAnalyzer:
 
         # --- Volumes (checked on the slow tick, no sustain needed) ---------
         for volume in volumes or []:
+            mount = str(volume.get("mountpoint"))
             free_pct = 100.0 - float(volume.get("percent") or 0.0)
+            writers = [w for w in (volume.get("writers") or []) if isinstance(w, dict)]
+            held = [h for h in (volume.get("held_deleted") or []) if isinstance(h, dict)]
+            held_bytes = sum(int(h.get("size") or 0) for h in held)
+            held_text = ""
+            if held:
+                top = held[0]
+                held_text = (f" {_mb(held_bytes)} of it is held by deleted files still "
+                             f"open ({top.get('name')} holds {_mb(top.get('size'))} of "
+                             f"{str(top.get('path'))[-60:]}): restarting that process, or "
+                             "truncating the file through /proc/<pid>/fd, frees it "
+                             "without a reboot.")
             if free_pct <= cfg.disk_space_low_pct:
                 candidates.append({
-                    "key": f"space_{volume.get('mountpoint')}",
+                    "key": f"space_{mount}",
                     "severity": "critical" if free_pct <= 3 else "warn",
-                    "title": f"{volume.get('mountpoint')} nearly full",
+                    "title": f"{mount} nearly full",
                     "detail": f"{free_pct:.1f}% free for users (ext4 reserves "
                               "~5% for root on top of this). Full filesystems "
                               "fail writes, break package upgrades, and "
-                              "journald starts dropping history.",
+                              "journald starts dropping history." + held_text,
                     "resource": "storage",
-                    "evidence": {"mountpoint": volume.get("mountpoint"),
+                    "evidence": {"mountpoint": mount,
                                  "free": volume.get("free"),
-                                 "percent_used": volume.get("percent")},
+                                 "percent_used": volume.get("percent"),
+                                 "held_by_deleted": held_bytes or None},
                     "sustained_ticks": cfg.sustain_ticks,
+                    "writers": writers, "mount": mount,
                 })
+            # Fill forecast: not full yet, but will be. The rate is a
+            # least-squares slope over the last hour; erratic growth (a
+            # burst then a plateau) is said to be erratic, not given an ETA
+            # to the minute.
+            forecast = volume.get("forecast") or {}
+            eta = forecast.get("seconds_to_full") if isinstance(forecast, dict) else None
+            key = f"space_forecast:{mount}"
+            active = (isinstance(eta, (int, float)) and float(eta) <= 24 * 3600
+                      and forecast.get("trend") == "growing" and free_pct > cfg.disk_space_low_pct)
+            if isinstance(eta, (int, float)):
+                hours = float(eta) / 3600
+                r2 = float(forecast.get("r2") or 0)
+                steadiness = ("steadily" if r2 >= 0.9 else "unevenly" if r2 >= 0.5 else "erratically")
+                consider(
+                    key, active,
+                    "critical" if hours <= 1 else "warn" if hours <= 6 else "info",
+                    f"{mount} will be full in about {_hours_text(hours)}",
+                    f"Used space has grown {steadiness} by {_mb(forecast.get('delta_bytes'))} "
+                    f"over the last {float(forecast.get('window_seconds') or 0) / 60:.0f} min "
+                    f"({_mb(forecast.get('rate_bytes_sec'))}/s, "
+                    f"{_mb(forecast.get('bytes_per_day'))}/day); {_mb(volume.get('free'))} "
+                    f"is left for users. At this rate it is full in about "
+                    f"{_hours_text(hours)}"
+                    + (" -- an extrapolation of an uneven trend, so treat the time as rough"
+                       if r2 < 0.9 else "")
+                    + ". The processes below are the ones writing there now."
+                    + held_text,
+                    "storage", {"mountpoint": mount, "free": volume.get("free"),
+                                "rate_bytes_sec": forecast.get("rate_bytes_sec"),
+                                "hours_to_full": round(hours, 1), "r2": r2,
+                                "held_by_deleted": held_bytes or None},
+                )
+                for candidate in reversed(candidates):
+                    if candidate.get("key") == key:
+                        candidate["writers"] = writers
+                        candidate["mount"] = mount
+                        break
+            else:
+                consider(key, False, "info", "", "", "storage", {})
 
         # --- Stuck processes (uninterruptible sleep) -----------------------
         stuck = [p for p in processes if p.get("stuck")]
@@ -556,6 +615,26 @@ class LagAnalyzer:
         for finding in candidates:
             if finding.get("external") and not finding.get("victims"):
                 finding["culprits"] = []
+            elif finding.get("mount"):
+                # Storage findings name the processes writing to *that*
+                # mount (open files under it), not the machine's top writers
+                # -- when nothing could be attributed, no culprits, and the
+                # payload's writers_note names the unlock.
+                finding["culprits"] = [
+                    {**_culprit_of(w, "storage"),
+                     "share": (f"{_mb(w.get('write_bytes_sec'))}/s"
+                               + (" (by working directory)" if w.get("by_cwd") else "")),
+                     "paths": w.get("paths") or []}
+                    for w in (finding.pop("writers", None) or [])
+                    if isinstance(w, dict) and w.get("pid") is not None
+                ]
+            elif finding.get("holder"):
+                # A ceiling has exactly one holder; ranking anything else
+                # under it would be invention.
+                holder = finding["holder"]
+                row = next((p for p in processes if p.get("pid") == holder.get("pid")), None)  # type: ignore[union-attr]
+                finding["culprits"] = ([_culprit_of(row, str(finding["resource"]))]
+                                       if row else [])
             elif finding.get("unit"):
                 unit_name = (finding["unit"] or {}).get("name")  # type: ignore[union-attr]
                 inside = [p for p in processes if p.get("unit") == unit_name]
@@ -567,6 +646,12 @@ class LagAnalyzer:
             # victims' side of the same measurement, from their own cgroups.
             if str(finding["key"]) in ("psi_cpu", "psi_memory", "psi_io"):
                 finding["suffering"] = _suffering(cgroups, str(finding["key"]))
+            # Memory findings say who the OOM killer would take first: the
+            # kernel's own ranking, so the "what happens next" is concrete.
+            if str(finding.get("resource")) == "memory" and isinstance(ceilings, dict):
+                victims = ((ceilings.get("oom") or {}).get("next") or [])[:3]
+                if victims:
+                    finding["next_victims"] = victims
             # What changed in the minutes before it began -- coincidence,
             # labelled as such; the reader draws the line.
             since = finding.get("since")
@@ -775,6 +860,71 @@ class LagAnalyzer:
                     finding.setdefault("evidence", {})["throttled_units"] = ", ".join(throttled[:3])
         return unit_oom
 
+    # ------------------------------------------------------------ ceilings
+    def _ceiling_findings(self, ceilings: dict | None, cgroups: dict | None,
+                          consider, cfg: Config) -> None:
+        """A hard limit at >=80% of its ceiling, with the process (or the
+        machine) holding it. Nothing is slow yet; the next call fails."""
+        keys: set[str] = set()
+        entries = (ceilings or {}).get("limits") if isinstance(ceilings, dict) \
+            and ceilings.get("available") else None
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            pct = float(entry.get("pct") or 0)
+            holder = entry.get("holder") if isinstance(entry.get("holder"), dict) else None
+            kind = str(entry.get("kind"))
+            key = f"ceiling:{kind}" + (f":{holder.get('pid')}" if holder and kind == "fds" else "")
+            keys.add(key)
+            who = (f"{holder.get('name')} (pid {holder.get('pid')})" if holder else "this machine")
+            share = entry.get("holder_share")
+            held = (f" {who} holds {int(share):,} of them." if holder and share else
+                    f" The holder is {who}." if holder and kind != "fds" else "")
+            lower = " The count is a lower bound: some processes' descriptors are not readable at this privilege level." \
+                if entry.get("partial") else ""
+            consider(
+                key, pct >= 80.0, "critical" if pct >= 95.0 else "warn",
+                f"{entry.get('label')} at {pct:.0f}% of the limit",
+                f"{int(entry.get('current') or 0):,} of {int(entry.get('max') or 0):,} in use."
+                f"{held} At the ceiling the next request fails outright (EMFILE, "
+                "a dropped connection, a watch that is never registered) rather "
+                f"than slowing down. Fix: {entry.get('fix') or 'raise the limit'}.{lower}",
+                "limits", {"current": entry.get("current"), "max": entry.get("max"),
+                           "pct": pct},
+            )
+            # consider() has no holder parameter; attach it to the candidate
+            # it just appended, if it did.
+            if holder:
+                for candidate in reversed(self._last_candidates):
+                    if candidate.get("key") == key:
+                        candidate["holder"] = holder
+                        break
+        # Per-unit task ceilings come from the cgroup walk (pids.max).
+        units = (cgroups or {}).get("units") if isinstance(cgroups, dict) \
+            and cgroups.get("available") else None
+        for unit in units or []:
+            if not isinstance(unit, dict):
+                continue
+            pids, pids_max = unit.get("pids"), unit.get("pids_max")
+            if not isinstance(pids, int) or not isinstance(pids_max, int) or pids_max <= 0:
+                continue
+            key = f"ceiling:unit_pids:{unit.get('cgroup')}"
+            keys.add(key)
+            pct = 100.0 * pids / pids_max
+            consider(
+                key, pct >= 80.0, "critical" if pct >= 95.0 else "warn",
+                f"{_unit_label(unit)} is near its task limit ({pct:.0f}%)",
+                f"{pids:,} of {pids_max:,} tasks (TasksMax / pids.max). At the "
+                "ceiling, fork() and thread creation inside the unit fail with "
+                "EAGAIN while the rest of the machine is fine. Fix: TasksMax= "
+                "in the unit, or DefaultTasksMax= in system.conf.",
+                "limits", {"tasks": pids, "tasks_max": pids_max, "pct": round(pct, 1)},
+                unit={"name": unit.get("unit"), "cgroup": unit.get("cgroup"),
+                      "manager": unit.get("manager"), "kind": unit.get("kind"),
+                      "container": unit.get("container"), "runtime_cap": False},
+            )
+        self._sustain.prune("ceiling:", keys)
+
     # ----------------------------------------------------------- the kernel
     def _kernel_findings(self, kernel: dict | None, processes: list[dict],
                          pressures: dict[str, float], consider, cfg: Config) -> None:
@@ -931,6 +1081,14 @@ def _suffering(cgroups: dict | None, key: str) -> list[dict[str, object]]:
             for value, unit in ranked[:3]]
 
 
+def _hours_text(hours: float) -> str:
+    if hours < 1:
+        return f"{hours * 60:.0f} min"
+    if hours < 48:
+        return f"{hours:.1f} h"
+    return f"{hours / 24:.1f} days"
+
+
 def _minutes_text(minutes: float) -> str:
     if minutes >= 90:
         return f"{minutes / 60:.1f} h"
@@ -988,17 +1146,18 @@ def _culprits(processes: list[dict], resource: str) -> list[dict[str, object]]:
         candidates = [p for p in candidates if float(p.get("cpu") or 0) > 0.1] \
             or candidates
     ranked = sorted(candidates, key=key)[:5]
-    return [
-        {
-            "pid": p["pid"], "name": p["name"], "username": p.get("username"),
-            "cpu": p.get("cpu"), "working_set": p.get("working_set"),
-            "io_bytes_sec": p.get("io_bytes_sec"), "gpu": p.get("gpu"),
-            "stuck": p.get("stuck"), "lag_score": p.get("lag_score"),
-            "share": _share_text(p, resource),
-            "container": p.get("container"),
-        }
-        for p in ranked
-    ]
+    return [_culprit_of(p, resource) for p in ranked]
+
+
+def _culprit_of(p: dict, resource: str) -> dict[str, object]:
+    return {
+        "pid": p["pid"], "name": p["name"], "username": p.get("username"),
+        "cpu": p.get("cpu"), "working_set": p.get("working_set"),
+        "io_bytes_sec": p.get("io_bytes_sec"), "gpu": p.get("gpu"),
+        "stuck": p.get("stuck"), "lag_score": p.get("lag_score"),
+        "share": _share_text(p, resource),
+        "container": p.get("container"),
+    }
 
 
 # wchan prefixes that mean "waiting on a remote filesystem". The kernel
@@ -1040,6 +1199,9 @@ def _share_text(proc: dict, resource: str) -> str:
         return f"{float(proc.get('gpu') or 0):.0f}% GPU"
     if resource == "responsiveness":
         return "D-state" if proc.get("stuck") else ""
+    if resource == "limits":
+        handles = proc.get("handles")
+        return f"{int(handles):,} open files" if isinstance(handles, int) else "holder"
     return ""
 
 
