@@ -228,11 +228,13 @@ class LagAnalyzer:
                  volumes: list[dict] | None = None,
                  cgroups: dict | None = None, kernel: dict | None = None,
                  changes: object = None,
-                 ceilings: dict | None = None) -> dict[str, object]:
+                 ceilings: dict | None = None,
+                 ports: dict | None = None) -> dict[str, object]:
         """Build the sustained-pressure findings and attribute them to processes.
 
         `cgroups` (per-unit pressure and limits), `kernel` (mdstat, per-core
-        interrupts) and `changes` (a ChangeLog) are optional: without them the
+        interrupts), `changes` (a ChangeLog), `ceilings` and `ports` (the port
+        map with its accept queues) are optional: without them the
         machine-level findings are exactly what they were.
         """
         cpu = snapshot.get("cpu") or {}
@@ -446,6 +448,9 @@ class LagAnalyzer:
         # --- Ceilings: a hard limit about to be reached, with its holder ----
         self._ceiling_findings(ceilings, cgroups, consider, cfg)
 
+        # --- Turned-away clients: a listener whose accept queue overflows --
+        self._port_findings(ports, consider)
+
         # --- Disk ----------------------------------------------------------
         latency_ms = disk_total.get("latency_ms")
         if latency_ms is not None:
@@ -627,6 +632,16 @@ class LagAnalyzer:
                      "paths": w.get("paths") or []}
                     for w in (finding.pop("writers", None) or [])
                     if isinstance(w, dict) and w.get("pid") is not None
+                ]
+            elif "listeners" in finding:
+                # A turned-away finding names the process(es) holding the
+                # listening socket -- the ones not calling accept() fast
+                # enough -- and nothing else. An empty list stays empty: when
+                # no queue was full at sampling time there is no name to give.
+                pids = set(finding.pop("listeners") or [])
+                finding["culprits"] = [
+                    {**_culprit_of(p, "network"), "share": "holds the listening socket"}
+                    for p in processes if p.get("pid") in pids
                 ]
             elif finding.get("holder"):
                 # A ceiling has exactly one holder; ranking anything else
@@ -924,6 +939,97 @@ class LagAnalyzer:
                       "container": unit.get("container"), "runtime_cap": False},
             )
         self._sustain.prune("ceiling:", keys)
+
+    # ------------------------------------------------------ turned away
+    def _port_findings(self, ports: dict | None, consider) -> None:
+        """A listener refusing clients: its accept queue is full while the
+        kernel's ListenOverflows counter ticks. The symptom side of "does it
+        matter" -- the service is up and may look idle, and clients time out.
+
+        The overflow counter is machine-wide (per network namespace) and only
+        a full queue can overflow, so a port is named only when its queue is
+        at its backlog at sampling time. Overflows with no full queue become
+        one unnamed finding that says the burst had drained, with no culprits
+        -- guessing the port would be invention.
+        """
+        keys: set[str] = set()
+        backlog = (ports or {}).get("backlog") if isinstance(ports, dict) \
+            and ports.get("available") else None
+        rate = backlog.get("overflows_sec") if isinstance(backlog, dict) \
+            and backlog.get("available") else None
+        if not isinstance(rate, (int, float)):
+            self._sustain.prune("turned_away", keys)
+            return
+        interval = backlog.get("interval")  # type: ignore[union-attr]
+        window = f"{float(interval):.0f} s" if isinstance(interval, (int, float)) else "the last interval"
+        cookies = backlog.get("syn_cookies_sec")  # type: ignore[union-attr]
+        cookie_text = (f" The SYN queue overflowed too ({float(cookies):.1f} SYN cookies/s): "
+                       "either a SYN flood or the same service failing to accept."
+                       if isinstance(cookies, (int, float)) and cookies > 0 else "")
+        named = 0
+        for entry in (ports.get("ports") if isinstance(ports, dict) else None) or []:  # type: ignore[union-attr]
+            if not isinstance(entry, dict) or not entry.get("turned_away"):
+                continue
+            queue = entry.get("accept_queue")
+            if not isinstance(queue, dict):
+                continue
+            port = entry.get("port")
+            key = f"turned_away:{port}"
+            keys.add(key)
+            named += 1
+            procs = [p for p in (entry.get("processes") or []) if isinstance(p, dict)]
+            primary = procs[0] if procs else None
+            unit = primary.get("unit") if primary else None
+            owners = entry.get("owners") or []
+            who = (f"{primary.get('name')} (pid {primary.get('pid')})" if primary
+                   else f"{', '.join(map(str, owners))}'s process" if owners
+                   else "a process this agent cannot see (needs CAP_SYS_PTRACE or root to name it)")
+            label = f"Port {port}" + (f" ({unit})" if unit else f" ({primary.get('name')})" if primary else "")
+            consider(
+                key, True, "critical" if float(rate) >= 10 else "warn",
+                f"{label} is turning clients away",
+                f"Its accept queue is full: {int(queue.get('current') or 0):,} completed "
+                f"connections are waiting for {who} to accept() them, against a listen "
+                f"backlog of {int(queue.get('max') or 0):,}, and the kernel dropped "
+                f"{float(rate):.1f} connection attempts/s over {window} (ListenOverflows). "
+                "Clients see timeouts and resets, not slowness -- the service never "
+                "sees them. It is not accepting fast enough: blocked, busy on one "
+                "thread, or out of workers. Fix: more workers or a faster accept "
+                "loop in the service; raising its listen backlog and "
+                f"net.core.somaxconn only buys time.{cookie_text}",
+                "network", {"port": port, "queue": queue.get("current"),
+                            "backlog": queue.get("max"),
+                            "overflows_sec": round(float(rate), 2),
+                            "syn_cookies_sec": cookies},
+            )
+            for candidate in reversed(self._last_candidates):
+                if candidate.get("key") == key:
+                    candidate["port"] = port
+                    candidate["unit_name"] = unit
+                    candidate["listeners"] = [p.get("pid") for p in procs if p.get("pid")]
+                    break
+        if float(rate) > 0 and not named:
+            key = "turned_away"
+            keys.add(key)
+            consider(
+                key, True, "warn",
+                f"Clients turned away: {float(rate):.1f} connection attempts/s dropped",
+                (backlog.get("note") if isinstance(backlog, dict) and backlog.get("note") else  # type: ignore[union-attr]
+                 f"The kernel dropped {float(rate):.1f} connection attempts/s over {window} "
+                 "for a full accept queue (ListenOverflows), but no listener's queue was "
+                 "full at the moment the port map was sampled -- the burst had drained.")
+                + " Nobody is named: the port can only be told by a queue that is full "
+                "when it is looked at. The Ports view shows each listener's queue against "
+                f"its backlog; the one that fills in bursts is the one to watch.{cookie_text}",
+                "network", {"overflows_sec": round(float(rate), 2),
+                            "listen_drops_sec": backlog.get("drops_sec"),  # type: ignore[union-attr]
+                            "syn_cookies_sec": cookies},
+            )
+            for candidate in reversed(self._last_candidates):
+                if candidate.get("key") == key:
+                    candidate["listeners"] = []
+                    break
+        self._sustain.prune("turned_away", keys)
 
     # ----------------------------------------------------------- the kernel
     def _kernel_findings(self, kernel: dict | None, processes: list[dict],

@@ -300,7 +300,8 @@ class Sampler:
         diagnosis = self.lag.diagnose(snapshot, processes, pressures, cfg,
                                       volumes=volumes, cgroups=cgroups,
                                       kernel=kernel, changes=self.changes,
-                                      ceilings=self.store.get("ceilings"))
+                                      ceilings=self.store.get("ceilings"),
+                                      ports=self.store.get("ports"))
 
         # Annotate unit main processes with the units they belong to.
         service_map = (self.store.get("services") or {}).get("by_pid") or {}
