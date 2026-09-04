@@ -12,27 +12,35 @@ the machine and pushes reports to the culprit host; it runs no dashboard and
 ```bash
 git clone https://github.com/OlaYZen/culprit-agent.git
 cd culprit-agent
-./agent.sh <host-url> <token>
-#   e.g.  ./agent.sh http://192.168.1.5:8787 web-01.<secret>
-#   get <token> from the host dashboard: Nodes > "Generate token"
+sudo ./agent.sh
 ```
 
-`agent.sh` creates a local `.venv` (psutil only), saves `agent.json`, and runs
-the agent, which pushes reports to the host over HTTP(S) and **opens no
-listening ports**. Run it under `sudo` for full port/process attribution.
+That is the whole install. `agent.sh` creates a local `.venv` (psutil only),
+then **asks** for the culprit host's URL and this node's token (get the token
+from the host dashboard: Nodes > "Generate token"; it looks like
+`<name>.<secret>`), checks that the host is reachable and accepts the token,
+saves both to `agent.json` (mode 600) so nothing is typed again, and offers to
+set the agent up as a systemd service that starts on boot and restarts on
+failure. Under `sudo` that is a **system** service running as root, which is
+what reads other users' processes, descriptors and ports; without `sudo` it is
+a **user** service that sees your own processes fully and others partly. The
+agent pushes reports to the host over HTTP(S) and **opens no listening ports**.
 
-Keep it running across reboots with the systemd *user* unit:
+Other ways to run it:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp culprit-agent.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now culprit-agent
-loginctl enable-linger $USER
+./agent.sh --run                                   # foreground, using the saved config
+./agent.sh --run http://192.168.1.1:8787 web-01.<secret>   # ...or with the values given
+./agent.sh --configure                             # change the host or token, then restart the service
+./agent.sh --install-only                          # venv only, no prompts (CI, images)
+./agent.sh --host https://hub:8787 --token web-01.<secret> --insecure   # self-signed TLS
 ```
 
-The unit assumes the bundle lives at `~/culprit-agent`; edit its two paths if
-you put it elsewhere.
+If you skip the prompt, nothing is saved and the agent needs the URL and
+token as arguments every time. The unit files in this folder are the manual
+alternative to the prompt (`culprit-agent.service` for a user unit,
+`culprit-agent.system.service` for root); `agent.sh` generates its own with
+the folder's real path.
 
 ## Docker
 
@@ -138,10 +146,10 @@ To build the image yourself: `docker build -t culprit-agent .`
 ## What's inside
 
 ```
-agent.sh                      bootstrap venv + save config + run (python -m culprit.agent)
+agent.sh                      install (venv), ask + save host/token, set up the service or run
 requirements-agent.txt        psutil, the only runtime dependency
-culprit-agent.service         systemd USER unit (unprivileged)
-culprit-agent.system.service  systemd SYSTEM unit, runs as root for full attribution
+culprit-agent.service         systemd USER unit (unprivileged) -- manual alternative to agent.sh
+culprit-agent.system.service  systemd SYSTEM unit, runs as root -- manual alternative to sudo ./agent.sh
 Dockerfile                    builds the ghcr.io/olayzen/culprit-agent image
 docker/entrypoint.sh          maps the CULPRIT_* env vars onto the agent CLI
 sync-package.sh               maintainer tool: refresh culprit/ from the repo

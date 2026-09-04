@@ -110,7 +110,7 @@ class Config:
     # agent to report to (blank = the address the dashboard was reached on);
     # `agent_command` is what runs the bundle -- set it to "sudo ./agent.sh" to
     # run the agent as root, which unlocks full port/process attribution.
-    deploy_host: str = ""            # e.g. "192.168.1.5:8787" or "https://hub:8787"
+    deploy_host: str = ""            # e.g. "192.168.1.1:8787" or "https://hub:8787"
     agent_command: str = "./agent.sh"
 
     # --- network trust ----------------------------------------------------

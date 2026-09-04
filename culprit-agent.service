@@ -1,9 +1,9 @@
 # culprit agent -- systemd *user* unit for a report-only node.
 #
-# Deploy: copy this whole `culprit-agent/` folder to the server (it is
-# self-contained -- it carries its own copy of the culprit package), then:
+# `./agent.sh` (without sudo) writes and enables an equivalent of this unit
+# with the folder's real path; this file is the manual alternative:
 #   cd ~/culprit-agent
-#   ./agent.sh <host-url> <token>          # first run writes agent.json
+#   ./agent.sh --configure                 # asks for host + token, writes agent.json
 #   mkdir -p ~/.config/systemd/user
 #   cp culprit-agent.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
@@ -11,8 +11,8 @@
 #   loginctl enable-linger $USER           # keep it running when you log out
 #
 # Assumes the bundle lives at ~/culprit-agent. If you put it elsewhere, edit the
-# two paths below. Runs unprivileged by default (run agent.sh with sudo for full
-# port/process attribution); it opens no listening ports.
+# two paths below. Runs unprivileged (run agent.sh with sudo for a root service
+# with full port/process attribution); it opens no listening ports.
 
 [Unit]
 Description=culprit monitoring agent (reports to the host node)
