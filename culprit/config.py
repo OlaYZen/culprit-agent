@@ -335,6 +335,29 @@ def _load_list(key: str, value: Any) -> list[str]:
     return kept
 
 
+def _clean_ui(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("expected an object")
+    if len(value) > 32:
+        raise ValueError("too many keys")
+    out: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key or len(key) > 48 \
+                or not all(c.isalnum() or c == "_" for c in key):
+            raise ValueError("keys are short identifiers")
+        if isinstance(item, bool) or item is None:
+            out[key] = item
+        elif isinstance(item, (int, float)):
+            out[key] = item if abs(item) < 1e12 else 0
+        elif isinstance(item, str):
+            if len(item) > 64:
+                raise ValueError(f"{key}: at most 64 characters")
+            out[key] = item
+        else:
+            raise ValueError(f"{key}: expected a scalar")
+    return out
+
+
 def update(patch: dict[str, Any], persist: bool = True) -> tuple[Config, list[str]]:
     """Apply a patch to the live config, optionally writing it to disk.
 
@@ -360,6 +383,17 @@ def update(patch: dict[str, Any], persist: bool = True) -> tuple[Config, list[st
                 errors.append(f"{key}: not editable at runtime")
                 continue
             spec = known[key]
+            if key == "ui":
+                # Free-form dashboard preferences (container label style,
+                # ...). A small flat dict of scalars: it travels in every
+                # SSE snapshot frame, so it must not become a dumping ground.
+                try:
+                    value = _clean_ui(value)
+                except ValueError as exc:
+                    errors.append(f"ui: {exc}")
+                    continue
+                setattr(cfg, key, value)
+                continue
             if key in LIST_FIELDS:
                 try:
                     value = LIST_FIELDS[key](trust.split_entries(value))
