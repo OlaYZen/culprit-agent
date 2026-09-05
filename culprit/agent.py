@@ -185,15 +185,15 @@ class Reporter:
         # Set after the sampler starts; the process collector the host's
         # relayed commands run against.
         self.proc = None
-        # Self-update state: recomputed on a slow cadence (see push()), never
-        # on every report -- a git-fetch-less capability check is cheap but a
-        # GitHub round trip every second is not. Set from run_agent() once
-        # the event loop exists, so a completed "update" command can ask for
-        # a clean restart from the executor thread it actually runs in.
+        # Self-update capability: recomputed on a slow cadence (see push()),
+        # never on every report. Whether an update is *available* is not
+        # this agent's call -- the host compares this agent's reported
+        # `version` against GitHub once for the whole fleet (NodeRegistry.
+        # refresh_remote_version). Set from run_agent() once the event loop
+        # exists, so a completed "update" command can ask for a clean
+        # restart from the executor thread it actually runs in.
         self._update_capable: bool | None = None
         self._update_reason: str | None = None
-        self._remote_version: str | None = None
-        self._update_available: bool | None = None
         self._last_capability_check = 0.0
         self._restart_after_post = False
         self.loop = None
@@ -237,17 +237,15 @@ class Reporter:
     def _refresh_update_state(self) -> None:
         """Recomputed every _CAPABILITY_RECHECK_S, not every report: a fresh
         install reports it immediately (_last_capability_check starts at 0),
-        after that a git-status check plus one GitHub GET every few minutes
-        is plenty for a schedule/button that fires at most a few times a day."""
+        after that a git-status check every few minutes is plenty for a
+        schedule/button that fires at most a few times a day. Whether an
+        update is *available* is not computed here -- the host checks
+        GitHub once for the whole fleet instead of once per agent."""
         now = time.monotonic()
         if now - self._last_capability_check < self._CAPABILITY_RECHECK_S:
             return
         self._last_capability_check = now
         self._update_capable, self._update_reason = updater.capability()
-        self._remote_version, _ = updater.fetch_remote_version(
-            updater.current_branch())
-        self._update_available = (self._remote_version is not None and
-                                  self._remote_version != __version__)
 
     def push(self) -> bool:
         """One report. Runs in a thread (urllib blocks)."""
@@ -260,8 +258,6 @@ class Reporter:
                 "interval_fast": config_module.get().interval_fast,
                 "update_capable": self._update_capable,
                 "update_reason": self._update_reason,
-                "update_available": self._update_available,
-                "remote_version": self._remote_version,
             },
             "snapshot": self._build_snapshot(),
         }

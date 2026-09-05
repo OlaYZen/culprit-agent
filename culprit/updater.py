@@ -1,20 +1,22 @@
 """Self-update: git-pull this checkout and restart, on the host's say-so.
 
-The agent never decides *when* to update -- that's the host's call (a manual
-click or its daily schedule), delivered as one more CommandBroker action,
-same channel as terminate/priority/throttle. This module only answers two
-questions the host needs to make that call, and does the update itself:
+The agent never decides *when* to update, nor whether one is even worth
+trying -- that is the host's call (a manual click or its daily schedule,
+gated by comparing this agent's reported version against the version.json
+GitHub publishes, checked once for the whole fleet rather than once per
+agent -- see culprit/nodes.py's NodeRegistry.refresh_remote_version on the
+host). This module only answers what the host cannot know from outside the
+machine, and does the update itself:
 
-    capability()          can this install even be updated this way, and why not
-    fetch_remote_version() is there a newer version.json published on GitHub
-    perform()              actually git-pull + reinstall + ask for a restart
+    capability()  can this install even be updated this way, and why not
+    perform()      actually git-pull + reinstall + ask for a restart
 
 Deliberately the "quickest dirtiest way": a real git clone with a working
 `origin` remote is the whole mechanism, restarted via a clean process exit
 that leans on the systemd unit's own `Restart=always` (see agent.sh). No
 `systemctl` shell-out, no separate installer, no version-number gate on the
-apply step -- fetch_remote_version() only gates *whether it's worth asking*,
-never whether git actually finds something to reset to.
+apply step -- perform() always resets to whatever origin/<branch> actually
+has, regardless of what any version string claims.
 
 Every git call passes `-c safe.directory=<ROOT>`: a system service (`sudo
 ./agent.sh`) runs as root over a checkout some other user cloned, and git
@@ -28,21 +30,16 @@ exactly this reason: a guessed reason is worse than none.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 
 from . import config as config_module
 
 log = logging.getLogger("culprit.agent.updater")
 
 _GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # never hang on a prompt
-_REMOTE_VERSION_URL = (
-    "https://raw.githubusercontent.com/OlaYZen/culprit-agent/{branch}/version.json")
 
 
 def _git(*args: str, timeout: float) -> tuple[bool, str]:
@@ -81,9 +78,9 @@ def _pip(*args: str, timeout: float) -> tuple[bool, str]:
 
 
 def current_branch() -> str:
-    """The checkout's branch, or "main" when there is no .git to ask (a
-    Docker or cp -r deployment) -- just the default fetch_remote_version()
-    compares against, never assumed capable of anything else."""
+    """The checkout's branch to reset to in perform(), or "main" when there
+    is no .git to ask (a Docker or cp -r deployment, which capability()
+    already refuses before this is ever called)."""
     if not (config_module.ROOT / ".git").is_dir():
         return "main"
     ok, out = _git("rev-parse", "--abbrev-ref", "HEAD", timeout=10)
@@ -111,21 +108,6 @@ def capability() -> tuple[bool, str | None]:
     if out.strip():
         return False, "the checkout has local modifications (git status is not clean)"
     return True, None
-
-
-def fetch_remote_version(branch: str) -> tuple[str | None, str | None]:
-    """(version, reason) from the version.json GitHub publishes for `branch`.
-    Independent of capability(): worth showing even on a Docker or cp -r
-    install that cannot self-apply an update."""
-    url = _REMOTE_VERSION_URL.format(branch=branch)
-    try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            data = json.loads(response.read())
-        return str(data["version"]), None
-    except urllib.error.URLError as exc:
-        return None, f"could not reach github: {exc}"
-    except (ValueError, KeyError, TypeError):
-        return None, f"version.json missing or unparsable on {branch}"
 
 
 def _cmd_err(cmd_id, status: int, message: str) -> dict:
