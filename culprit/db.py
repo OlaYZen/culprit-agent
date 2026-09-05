@@ -26,17 +26,22 @@ import secrets
 import sqlite3
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 log = logging.getLogger("culprit.db")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # The host machine's own data is node 'local'; agent nodes use their enrolled
 # name. Kept as a plain column (not a separate DB per node) so cross-node
 # queries stay one SQL statement away.
 LOCAL_NODE = "local"
+
+# A death's recorder frames, inflated: the caps in coroner.py keep a real one
+# under a few MB, so this is a ceiling against a damaged row, not a budget.
+_MAX_FRAMES_BYTES = 32 * 1024 * 1024
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -171,6 +176,29 @@ CREATE TABLE IF NOT EXISTS actions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_actions_ts ON actions(ts);
+
+-- Deaths: how a node (or its agent) stopped, reconstructed by the Coroner
+-- from the agent's flight recorder and the previous boot's journal. `uid`
+-- is the agent's own id (previous boot id + time), so a re-sent report is
+-- ignored. `frames` is the recorder (gzip JSON), read only for one death's
+-- detail page; `verdict` and `evidence` are JSON.
+CREATE TABLE IF NOT EXISTS deaths (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    node        TEXT NOT NULL,
+    uid         TEXT NOT NULL,
+    kind        TEXT NOT NULL,                -- machine | agent
+    died_at     REAL NOT NULL,
+    detected_at REAL NOT NULL,
+    class       TEXT,
+    severity    TEXT,
+    title       TEXT,
+    verdict     TEXT,
+    evidence    TEXT,
+    frames      BLOB,
+    UNIQUE (node, uid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deaths_ts ON deaths(died_at);
 
 -- Dashboard users. Passwords are scrypt-hashed with a per-user salt; the
 -- plaintext never touches the database.
@@ -396,6 +424,10 @@ class History:
                 # Events are kept longer -- a bluescreen from six weeks ago is
                 # still the most interesting thing in the database.
                 conn.execute("DELETE FROM events WHERE ts < ?",
+                             (now - max(retention_days, 90) * 86_400,))
+                # Deaths likewise: a machine that died twice this quarter is
+                # the question the Coroner exists to answer.
+                conn.execute("DELETE FROM deaths WHERE died_at < ?",
                              (now - max(retention_days, 90) * 86_400,))
                 conn.commit()
             except sqlite3.Error as exc:
@@ -648,6 +680,88 @@ class History:
             out.append(entry)
         return out
 
+    # ------------------------------------------------------------------ deaths
+    def write_death(self, node: str, uid: str, kind: str, died_at: float,
+                    detected_at: float, verdict: dict[str, Any],
+                    evidence: dict[str, Any], frames: bytes | None) -> int | None:
+        """Store one death; None when this (node, uid) is already stored --
+        an agent re-sends its report until the host answers, so the second
+        copy must be a no-op rather than a second grave."""
+        if not self.ready:
+            return None
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return None
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO deaths (node, uid, kind, died_at, detected_at, "
+                    "class, severity, title, verdict, evidence, frames) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (node, _text(uid, 200), kind, died_at, detected_at,
+                     _text(verdict.get("class"), 64), _text(verdict.get("severity"), 16),
+                     _text(verdict.get("title"), 300),
+                     _text(json.dumps(verdict, default=str), 200_000),
+                     _text(json.dumps(evidence, default=str), 400_000), frames),
+                )
+                conn.commit()
+                return int(cur.lastrowid or 0) if cur.rowcount else None
+            except (sqlite3.Error, UnicodeEncodeError) as exc:
+                log.warning("death write failed: %s", exc)
+                return None
+
+    def deaths(self, node: str | None = None, since: float | None = None,
+               limit: int = 50) -> list[dict[str, Any]]:
+        """Deaths newest first, without the recorder frames (the list is
+        polled; the frames are read for one death at a time)."""
+        if not self.ready:
+            return []
+        clauses, params = ["1=1"], []
+        if node:
+            clauses.append("node = ?")
+            params.append(node)
+        if since:
+            clauses.append("died_at >= ?")
+            params.append(since)
+        params.append(limit)
+        rows = self._query(
+            f"SELECT id, node, uid, kind, died_at, detected_at, class, severity, title, "
+            f"verdict FROM deaths WHERE {' AND '.join(clauses)} ORDER BY died_at DESC LIMIT ?",
+            tuple(params))
+        out = []
+        for row in rows:
+            entry = dict(row)
+            entry["verdict"] = _json(entry.pop("verdict"))
+            # The frames summary travels with the verdict; the list does not
+            # need the whole host context.
+            out.append(entry)
+        return out
+
+    def death(self, death_id: int) -> dict[str, Any] | None:
+        if not self.ready:
+            return None
+        rows = self._query("SELECT * FROM deaths WHERE id = ?", (death_id,))
+        if not rows:
+            return None
+        entry = dict(rows[0])
+        entry["verdict"] = _json(entry.pop("verdict"))
+        entry["evidence"] = _json(entry.pop("evidence"))
+        frames = entry.pop("frames", None)
+        recorder: dict[str, Any] | None = None
+        if frames:
+            # The blob is ours (written by Coroner.record within its caps), but
+            # a bounded inflate costs nothing and keeps one rule everywhere:
+            # gzip from outside this process is never inflated unbounded.
+            try:
+                inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                raw = inflater.decompress(bytes(frames), _MAX_FRAMES_BYTES + 1)
+                if len(raw) <= _MAX_FRAMES_BYTES and inflater.eof:
+                    recorder = json.loads(raw.decode("utf-8"))
+            except (zlib.error, ValueError, UnicodeDecodeError):
+                recorder = None
+        entry["recorder"] = recorder
+        return entry
+
     # ------------------------------------------------------------ expectations
     def list_expectations(self) -> list[dict[str, Any]]:
         if not self.ready:
@@ -770,7 +884,8 @@ class History:
         if not self.ready:
             return {"available": False, "reason": self.error or "history disabled"}
         counts: dict[str, Any] = {}
-        for table in ("samples", "proc_samples", "events", "findings", "actions"):
+        for table in ("samples", "proc_samples", "events", "findings", "actions",
+                      "deaths"):
             rows = self._query(f"SELECT COUNT(*) AS n FROM {table}")
             counts[table] = rows[0]["n"] if rows else 0
         span = self._query("SELECT MIN(ts) AS oldest, MAX(ts) AS newest FROM samples")
@@ -971,7 +1086,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     log.info("migrating history database v%s -> v%s", version, SCHEMA_VERSION)
     if version >= 2:
-        # v2 -> v3 only adds tables; CREATE IF NOT EXISTS is the whole job.
+        # v2 -> v3 -> v4 only add tables; CREATE IF NOT EXISTS is the whole job.
         conn.executescript(_SCHEMA)
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
                      "('schema_version', ?)", (str(SCHEMA_VERSION),))
@@ -1127,6 +1242,16 @@ def _compact(event: dict[str, Any]) -> dict[str, Any]:
         if key not in ("data", "source_label", "channel", "computer")
         and value is not None
     }
+
+
+def _json(value: Any) -> Any:
+    """A stored JSON column, or None when it is empty or damaged."""
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _f(value: Any) -> float | None:

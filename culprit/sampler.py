@@ -40,6 +40,7 @@ from .collectors import ceilings as ceilings_mod
 from .collectors import cgroups as cgroups_mod
 from .collectors import kernel as kernel_mod
 from .collectors.changes import ChangeLog
+from .collectors.recorder import FlightRecorder
 from .collectors import sync as sync_mod
 from .collectors import sysinfo as sysinfo_mod
 from .collectors.cpu_mem import CpuMemoryCollector
@@ -75,11 +76,16 @@ WARMUP_STAGES: tuple[str, ...] = (
 
 
 class Sampler:
-    def __init__(self, store: Store, broker: Broker, history: History) -> None:
+    def __init__(self, store: Store, broker: Broker, history: History,
+                 recorder: FlightRecorder | None = None) -> None:
         self.store = store
         self.broker = broker
         self.history = history
         self.lag = LagAnalyzer()
+        # The flight recorder (the Coroner's black box): fed by the fast and
+        # proc tiers, flushed to disk every few seconds, marked clean on a
+        # handled stop. The agent passes one; the host has nothing to record.
+        self.recorder = recorder
 
         self._executors = {
             name: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tpc-{name}")
@@ -161,6 +167,13 @@ class Sampler:
             self._flush_bucket(force=True)
         except Exception as exc:
             log.debug("final flush failed: %s", exc)
+        if self.recorder is not None:
+            # A handled stop is not a death: the next start must not read
+            # this recording as one.
+            try:
+                self.recorder.mark_clean_stop()
+            except Exception as exc:  # noqa: BLE001 -- shutdown must finish regardless
+                log.debug("recorder clean-stop mark failed: %s", exc)
         for name, executor in self._executors.items():
             executor.submit(self._close_collectors, name)
             executor.shutdown(wait=True)
@@ -264,6 +277,9 @@ class Sampler:
         })
         self.store.push_live(timestamp, sample)
         self._accumulate(timestamp, sample)
+        if self.recorder is not None:
+            self.recorder.observe_fast(sample)
+            self.recorder.maybe_flush(timestamp)
 
         self.broker.publish("fast", {
             "ts": timestamp,
@@ -313,6 +329,8 @@ class Sampler:
 
         ranked = sorted(processes, key=lambda p: -float(p.get("lag_score") or 0))
         trimmed = ranked[:cfg.process_count]
+        if self.recorder is not None:
+            self.recorder.observe_proc(ranked, diagnosis)
 
         self._bucket_worst = _worse(self._bucket_worst, str(diagnosis["severity"]))
         self._bucket_top = [
@@ -463,6 +481,7 @@ class Sampler:
                 for name in ("fast", "proc", "slow", "events")
             },
             "history": self.history.stats(),
+            "recorder": self.recorder.status() if self.recorder is not None else None,
         }
 
 
