@@ -34,12 +34,18 @@ log = logging.getLogger("culprit.services")
 _PROPS = ("Id,Description,LoadState,ActiveState,SubState,UnitFileState,"
           "MainPID,ExecMainStatus,NRestarts,Result,Type,RemainAfterExit,"
           "ActiveEnterTimestamp,InactiveEnterTimestamp,ExecMainExitTimestamp,"
-          "ConditionResult,ControlGroup,User")
+          "ConditionResult,ControlGroup,User,WantedBy")
 
 # A unit that ran at boot and exited cleanly within this many seconds of it
 # did its job (dmesg.service saving the boot log, a one-off setup script
 # declared Type=simple): not a daemon that is missing.
 _BOOT_JOB_WINDOW_S = 900.0
+# Targets that only the boot sequence reaches: a unit pulled in by nothing
+# but these has no reason to be running later.
+_BOOT_TARGETS = frozenset({"sysinit.target", "basic.target", "local-fs.target",
+                           "local-fs-pre.target", "remote-fs.target", "rescue.target",
+                           "emergency.target", "initrd.target", "shutdown.target"})
+_FINISHED_LINE = r"Finished |Deactivated successfully|Succeeded\."
 
 
 class ServiceCollector:
@@ -47,6 +53,10 @@ class ServiceCollector:
         # unit -> (monotonic, cpu_usec) for cgroup CPU% deltas across ticks.
         self._prev_cpu: dict[str, tuple[float, int]] = {}
         self._prev_io: dict[str, tuple[float, int, int]] = {}
+        # unit -> when its last run ended, from the journal: systemd unloads
+        # an inactive unit and `systemctl show` then reports no timestamps,
+        # so a boot job that finished needs its journal line to prove it.
+        self._exit_cache: dict[str, float | None] = {}
 
     def sample(self) -> dict[str, object]:
         system = self._scope("system")
@@ -65,7 +75,16 @@ class ServiceCollector:
                     "timers": []}
 
         services = system["services"] + user["services"]
-        problems = _find_problems(services, boot_time=_boot_time())
+        boot_time = _boot_time()
+        for service in services:
+            if _boot_job_candidate(service) and service.get("exited_at") is None:
+                name = str(service["name"])
+                if name not in self._exit_cache:
+                    self._exit_cache[name] = _journal_exit(name, str(service.get("scope")))
+                service["exited_at"] = self._exit_cache[name]
+            elif service.get("active_state") != "inactive":
+                self._exit_cache.pop(str(service["name"]), None)
+        problems = _find_problems(services, boot_time=boot_time)
         problems.sort(key=lambda p: (0 if p["severity"] == "critical" else 1,
                                      str(p["display_name"] or p["name"])))
 
@@ -207,9 +226,10 @@ class ServiceCollector:
                 "condition_result": detail.get("ConditionResult"),
                 "since": _parse_stamp(detail.get("ActiveEnterTimestamp")),
                 "inactive_since": _parse_stamp(detail.get("InactiveEnterTimestamp")),
-                # When the main process ended on its own; empty while it runs
-                # and for a unit that never ran.
+                # When the main process ended on its own; empty while it runs,
+                # for a unit that never ran, and for one systemd has unloaded.
                 "exited_at": _parse_stamp(detail.get("ExecMainExitTimestamp")),
+                "wanted_by": (detail.get("WantedBy") or "").split(),
             }
             entry.update(self._cgroup_usage(name, detail.get("ControlGroup"), now))
             services.append(entry)
@@ -347,16 +367,50 @@ def _find_problems(services: list[dict],
     return problems
 
 
+def _boot_job_candidate(service: dict) -> bool:
+    """Enabled, inactive, ended cleanly, and not already excused as a
+    oneshot or by a false condition: the units the boot-job test applies to."""
+    return (service.get("start_type") == "enabled"
+            and service.get("active_state") == "inactive"
+            and service.get("result") == "success"
+            and service.get("exit_status") == 0
+            and not (service.get("type") == "oneshot" and not service.get("remain_after_exit"))
+            and service.get("condition_result") != "no")
+
+
 def _finished_boot_job(service: dict, boot_time: float | None) -> bool:
     """Ran at boot, exited 0 by itself, within the boot window: a job that
     finished, not a daemon that died. A daemon stopped by hand days later
-    has the same result but an exit time far from boot, and stays a problem."""
+    has the same result but an exit time far from boot, and stays a problem.
+
+    The exit time comes from systemd's properties while the unit is still
+    loaded, else from the unit's own journal line ("Finished ...",
+    "Deactivated successfully"). With neither, a unit that only the boot
+    targets pull in (WantedBy=sysinit.target) is a boot job by its wiring:
+    nothing later would ever start it.
+    """
     if service.get("result") != "success" or service.get("exit_status") != 0:
         return False
     exited = service.get("exited_at")
-    if not isinstance(exited, (int, float)) or not boot_time:
-        return False
-    return 0 <= exited - boot_time <= _BOOT_JOB_WINDOW_S
+    if isinstance(exited, (int, float)) and boot_time:
+        return 0 <= exited - boot_time <= _BOOT_JOB_WINDOW_S
+    wanted = service.get("wanted_by") or []
+    return bool(wanted) and all(target in _BOOT_TARGETS for target in wanted)
+
+
+def _journal_exit(name: str, scope: str) -> float | None:
+    """When the unit's last run in this boot ended, from systemd's own line
+    in the unit's journal (~20 ms, once per unit while it stays inactive)."""
+    match = ["--user-unit", name] if scope == "user" else ["-u", name]
+    entries = linux.journalctl_json(["-b", *match, "-g", _FINISHED_LINE],
+                                    timeout=10, max_entries=1)
+    if not entries:
+        return None
+    raw = entries[0].get("_SOURCE_REALTIME_TIMESTAMP") or entries[0].get("__REALTIME_TIMESTAMP")
+    try:
+        return int(raw) / 1e6
+    except (TypeError, ValueError):
+        return None
 
 
 def _boot_time() -> float | None:
