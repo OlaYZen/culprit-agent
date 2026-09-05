@@ -32,6 +32,7 @@ box's own listeners once an hour, timedatectl once a minute.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import socket
 import ssl
@@ -375,7 +376,10 @@ class OutageCollector:
         ok = bool(probe.get("ok"))
         self._dns_bad_ticks = 0 if ok else self._dns_bad_ticks + 1
         checks["dns"] = {"available": True, "ok": ok, "latency_ms": probe.get("latency_ms"),
-                         "timeouts_per_min": rate, "error": probe.get("error")}
+                         "timeouts_per_min": rate, "error": probe.get("error"),
+                         "timeouts_reason": None if os.geteuid() == 0 else
+                         "resolved's timeout counter needs root (resolvectl statistics is "
+                         "polkit-guarded and would prompt on a desktop)"}
         if ok or self._dns_bad_ticks < 2:
             return []
         return [{
@@ -730,7 +734,16 @@ def _time_sync(services: dict) -> dict[str, Any]:
 
 
 def _resolved_stats() -> int | None:
-    """systemd-resolved's own timeout counter, or None without resolved."""
+    """systemd-resolved's own timeout counter, or None without resolved.
+
+    Root only: `resolvectl statistics` is guarded by the polkit action
+    org.freedesktop.resolve1.dump-statistics (systemd 254+), and for an
+    unprivileged user the desktop's polkit agent answers it with a password
+    prompt every time. A monitoring agent must never raise a dialog on the
+    machine it watches, so without root the counter is honestly absent.
+    """
+    if os.geteuid() != 0:
+        return None
     text = linux.run(["resolvectl", "statistics"], timeout=5)
     if not text:
         return None
