@@ -165,6 +165,18 @@ if ! .venv/bin/python -c 'import culprit.agent' 2>/dev/null; then
     exit 1
 fi
 
+# Under sudo, everything this script creates (.venv, agent.json, data/) is
+# root's, and a `chown -R root` of the checkout used to follow -- which broke
+# `git pull` for the person who cloned it (.git/FETCH_HEAD: Permission
+# denied). Root reads a user-owned bundle just fine, so the checkout is
+# handed back to whoever ran sudo, every time, and only the service is root's.
+reclaim_ownership() {
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$HERE" 2>/dev/null || true
+    fi
+}
+reclaim_ownership
+
 # ==============================================================================
 # 2. CONFIGURE  (host URL + token, saved to agent.json)
 # ==============================================================================
@@ -350,6 +362,7 @@ fi
 # ==============================================================================
 if [ "$MODE" = "run" ]; then
     show_config
+    reclaim_ownership
     exec .venv/bin/python -m culprit.agent "${ARGS[@]+"${ARGS[@]}"}"
 fi
 
@@ -373,8 +386,9 @@ setup_service() {
     local owner_note=""
     if [ "$AS_ROOT" -eq 1 ]; then
         # Root reads every process's descriptors and IO: that is the point
-        # of running it this way. The bundle it runs from becomes root's.
-        chown -R root:root "$HERE" 2>/dev/null || true
+        # of running it this way. The bundle stays the invoking user's (see
+        # reclaim_ownership); root needs no ownership to read and run it.
+        reclaim_ownership
     else
         owner_note="  note: as $USER it sees your own processes fully and other users' partly
         (no per-process IO or descriptor counts for them). Run ./agent.sh under
