@@ -37,6 +37,8 @@ from pathlib import Path
 
 from . import __version__
 from . import config as config_module
+from .collectors import forensics
+from .collectors import recorder as recorder_mod
 from .db import History
 from .sampler import Sampler
 from .state import Broker, Store
@@ -44,6 +46,9 @@ from .state import Broker, Store
 log = logging.getLogger("culprit.agent")
 
 CONFIG_PATH = config_module.ROOT / "agent.json"
+# The flight recorder: the last ten minutes, rewritten every few seconds, so
+# the next start can say how the previous run ended (see collectors/recorder.py).
+RECORDER_PATH = config_module.ROOT / "data" / "flight-recorder.json.gz"
 
 _DEFAULTS = {
     "host_url": "",            # e.g. https://hub.example:8787
@@ -156,6 +161,10 @@ class Reporter:
             self.consecutive_failures = 0
             # Delivered: what we just sent is what the host now has.
             self._sent_ids.update(self._pending_ids)
+            if payload["snapshot"].get("coroner") is not None:
+                # A death report is delivered once; the host stored it. (An
+                # old host drops the unknown section -- also once.)
+                self.store.put("coroner", None)
             # A host that does not know this node (fresh start, restarted)
             # holds a partial merge at best -- resend everything next time.
             self._full_next = not reply.get("known", True)
@@ -290,13 +299,24 @@ async def run_agent(cfg: dict) -> int:
     store = Store()
     broker = Broker()  # zero subscribers: publish() is a no-op
     history = History(config_module.DEFAULT_DB_PATH, enabled=False)
-    sampler = Sampler(store, broker, history)
+    # Before anything else: did the previous run end badly? The recording on
+    # disk is read before a new recorder overwrites it.
+    death = recorder_mod.detect_death(RECORDER_PATH, recorder_mod.boot_id())
+    flight = recorder_mod.FlightRecorder(RECORDER_PATH)
+    sampler = Sampler(store, broker, history, recorder=flight)
     await sampler.start()
 
     reporter = Reporter(store, cfg)
     reporter.proc = sampler.proc  # the collector relayed commands run against
     log.info("agent '%s' reporting to %s every %.0fs",
              reporter.node_name, reporter.url, reporter.interval)
+    if death is not None:
+        log.warning("the previous run ended without a clean stop %.0f s ago "
+                    "(%s died); collecting the evidence for the host's Coroner",
+                    death["gap_seconds"], "the machine" if death["kind"] == "machine"
+                    else "the agent")
+        await asyncio.get_running_loop().run_in_executor(
+            None, _report_death, store, death)
 
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -365,6 +385,30 @@ def main(argv: list[str] | None = None) -> int:
         log.info("saved %s", CONFIG_PATH)
 
     return asyncio.run(run_agent(cfg))
+
+
+def _report_death(store: Store, death: dict) -> None:
+    """Gather the previous boot's evidence and queue the death for the host.
+
+    Runs in a thread: the journal queries take up to a few hundred ms. The
+    `coroner` section is sent with the next report and cleared once the host
+    has acknowledged it (Reporter.push), so it costs one report, not every.
+    """
+    try:
+        evidence = forensics.investigate(death)
+    except Exception as exc:  # noqa: BLE001 -- a failed investigation is still a death
+        log.warning("forensics failed: %s", exc)
+        evidence = {"notes": [f"forensics failed: {exc}"], "markers": [], "tail": []}
+    system = store.get("system") or {}
+    record = {
+        **death,
+        "id": f"{death.get('prev_boot_id') or 'agent'}:{int(death['died_at'])}",
+        "evidence": evidence,
+        "agent_version": __version__,
+        "hostname": system.get("hostname"),
+        "boot_time": system.get("boot_time"),
+    }
+    store.put("coroner", {"available": True, "deaths": [record]})
 
 
 def _cmd_err(cmd_id, status, message):  # type: ignore[no-untyped-def]
