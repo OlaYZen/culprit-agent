@@ -39,6 +39,7 @@ from .collectors import services as svc_mod
 from .collectors import ceilings as ceilings_mod
 from .collectors import cgroups as cgroups_mod
 from .collectors import kernel as kernel_mod
+from .collectors import outage as outage_mod
 from .collectors.changes import ChangeLog
 from .collectors.recorder import FlightRecorder
 from .collectors import sync as sync_mod
@@ -113,6 +114,7 @@ class Sampler:
         self.cgroups: cgroups_mod.CgroupCollector | None = None
         self.kernel: kernel_mod.KernelCollector | None = None
         self.ceilings: ceilings_mod.CeilingCollector | None = None
+        self.outage: outage_mod.OutageCollector | None = None
         self.changes: ChangeLog | None = None
 
         # Rollup accumulation.
@@ -377,6 +379,8 @@ class Sampler:
             self.sync = sync_mod.SyncCollector()
         if self.ceilings is None:
             self.ceilings = ceilings_mod.CeilingCollector()
+        if self.outage is None:
+            self.outage = outage_mod.OutageCollector()
 
         # The volume collector names the processes writing to each mount
         # (open files under it) from the latest process table.
@@ -410,6 +414,11 @@ class Sampler:
             self.changes.observe_ports(ports)
             self.changes.observe_network(net_detail)
             payload["changes"] = self.changes.snapshot()
+        # The Outage Doctor reads what this tick just produced (and the last
+        # events tick), so it runs after the rest and never re-collects.
+        payload["outage"] = self.outage.sample(
+            services, ports, volumes, self.store.get("events"), net_detail,
+            system, changes=self.changes)
         self.store.merge(payload)
         self.broker.publish("slow", payload)
 
