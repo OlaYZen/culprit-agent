@@ -23,7 +23,10 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import shutil
 import socket
+import struct
+import subprocess
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -260,8 +263,13 @@ class NetworkDetailCollector:
         self._probe_at = 0.0
         self._wan: dict[str, object] | None = None
         self._wan_at = 0.0
+        # (local, peer) -> (monotonic, bytes_sent, bytes_received) of the last
+        # tick, so each established connection carries a byte rate.
+        self._conn_prev: dict[tuple[str, str], tuple[float, int, int]] = {}
 
-    def sample(self) -> dict[str, object]:
+    def sample(self, processes: list[dict] | None = None) -> dict[str, object]:
+        """`processes` (the latest process table) names the process and unit
+        behind each connection, so the Map can say nginx, not pid 4242."""
         now = time.monotonic()
         # Config changes on VPN connect/disconnect and DHCP renewal, so it
         # refreshes every 60s rather than caching for the process lifetime.
@@ -269,7 +277,7 @@ class NetworkDetailCollector:
             self._config = _adapter_config()
             self._config_at = now
 
-        sockets = _socket_table()
+        sockets = _socket_table(processes or [], self._conn_prev, now)
 
         if now - self._probe_at > 30:
             self._probe_cache = _connectivity(self._config or [])
@@ -423,12 +431,24 @@ def _dns_config() -> tuple[list[str], str | None, str]:
     return servers, domain, "/etc/resolv.conf"
 
 
-def _socket_table() -> dict[str, object]:
+def _socket_table(processes: list[dict], conn_prev: dict[tuple[str, str], tuple[float, int, int]],
+                  now: float) -> dict[str, object]:
     """Aggregate socket state plus listeners and peers per process.
 
     /proc/net/* is world-readable, but mapping a socket inode to its owning
     PID needs that process's /proc/<pid>/fd -- so other users' sockets appear
     with pid=null. Counted and reported, never hidden.
+
+    Each established TCP connection also carries what the kernel knows about
+    it, read passively -- no probe is sent, so no peer sees anything: the
+    smoothed round-trip time and retransmit count (`ss -ti`, ~10 ms for a
+    few hundred sockets; the one unprivileged place tcp_info is exposed), the
+    send and receive queues (a send queue that stays full means the peer is
+    not draining; a receive queue that does means this process is not
+    reading), and a byte rate from two readings of the connection's counters.
+    Without `ss` the queues still come from /proc/net/tcp and the rest is
+    honestly absent. Summed per process this is also "who is using the
+    network", which no /proc counter gives directly.
     """
     try:
         connections = psutil.net_connections(kind="inet")
@@ -439,11 +459,22 @@ def _socket_table() -> dict[str, object]:
         return {"available": False, "reason": str(exc), "by_state": {},
                 "entries": []}
 
+    names: dict[int, tuple[str | None, str | None]] = {}
+    for row in processes:
+        try:
+            names[int(row.get("pid"))] = (row.get("name"), row.get("unit"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+    info, ss_reason = _ss_established()
+    if ss_reason is not None:
+        info = _proc_net_established()
+
     by_state: dict[str, int] = {}
     by_pid: dict[int, dict[str, object]] = {}
     listeners: list[dict[str, object]] = []
     established: list[dict[str, object]] = []
     unattributed = 0
+    seen_keys: set[tuple[str, str]] = set()
 
     for conn in connections:
         state = conn.status or "NONE"
@@ -462,11 +493,37 @@ def _socket_table() -> dict[str, object]:
                                         else "IPv4"})
         elif state == psutil.CONN_ESTABLISHED:
             slot["established"] = int(slot["established"]) + 1  # type: ignore[arg-type]
-            established.append({"pid": pid, "local": local, "remote": remote})
+            if pid and pid not in names:
+                # Not in the (trimmed) process table: one /proc read names it.
+                names[pid] = (linux.read_line(f"/proc/{pid}/comm"),
+                              linux.unit_from_cgroup(pid))
+            name, unit = names.get(pid, (None, None))
+            entry: dict[str, object] = {"pid": pid, "name": name, "unit": unit,
+                                        "local": local, "remote": remote}
+            key = (str(local), str(remote))
+            stats = info.get(key) if conn.type == socket.SOCK_STREAM else None
+            if stats:
+                entry.update(stats)
+                sent, recv = stats.get("bytes_sent"), stats.get("bytes_received")
+                if isinstance(sent, int) and isinstance(recv, int):
+                    prev = conn_prev.get(key)
+                    if prev and now > prev[0]:
+                        dt = now - prev[0]
+                        entry["send_bytes_sec"] = round(max(0, sent - prev[1]) / dt)
+                        entry["recv_bytes_sec"] = round(max(0, recv - prev[2]) / dt)
+                    conn_prev[key] = (now, sent, recv)
+                    seen_keys.add(key)
+            established.append(entry)
         else:
             slot["other"] = int(slot["other"]) + 1  # type: ignore[arg-type]
 
+    # Connections that closed take their counters with them.
+    for key in [k for k in conn_prev if k not in seen_keys]:
+        del conn_prev[key]
+
     listeners.sort(key=lambda entry: str(entry["local"]))
+    established.sort(key=lambda e: -(float(e.get("send_bytes_sec") or 0)
+                                     + float(e.get("recv_bytes_sec") or 0)))
     return {
         "available": True,
         "reason": None,
@@ -480,7 +537,143 @@ def _socket_table() -> dict[str, object]:
             if unattributed else None),
         "listeners": listeners[:200],
         "established": established[:400],
+        "per_process": _per_process(established, names),
+        # Whether the per-connection RTT / retransmits / byte counters were
+        # readable; the queues alone still come from /proc/net/tcp.
+        "tcp_info": ss_reason is None,
+        "tcp_info_reason": ss_reason,
     }
+
+
+def _per_process(established: list[dict[str, object]],
+                 names: dict[int, tuple[str | None, str | None]]) -> list[dict[str, object]]:
+    """Who is using the network: each process's connections summed. Only
+    what the kernel exposes per socket -- a process whose sockets are not
+    attributable (another user's, without CAP_SYS_PTRACE) is not here, and
+    the socket table's unattributed count says how many that is."""
+    by_pid: dict[int, dict[str, object]] = {}
+    for entry in established:
+        pid = int(entry.get("pid") or 0)
+        if not pid:
+            continue
+        slot = by_pid.setdefault(pid, {
+            "pid": pid, "name": names.get(pid, (None, None))[0],
+            "unit": names.get(pid, (None, None))[1], "connections": 0,
+            "send_bytes_sec": 0, "recv_bytes_sec": 0, "rtt_ms": None,
+            "retrans": 0, "tx_queue": 0, "rx_queue": 0, "peers": set(),
+        })
+        slot["connections"] = int(slot["connections"]) + 1  # type: ignore[arg-type]
+        slot["send_bytes_sec"] = int(slot["send_bytes_sec"]) + int(entry.get("send_bytes_sec") or 0)  # type: ignore[arg-type]
+        slot["recv_bytes_sec"] = int(slot["recv_bytes_sec"]) + int(entry.get("recv_bytes_sec") or 0)  # type: ignore[arg-type]
+        rtt = entry.get("rtt_ms")
+        if isinstance(rtt, (int, float)) and (slot["rtt_ms"] is None or rtt > float(slot["rtt_ms"])):  # type: ignore[arg-type]
+            slot["rtt_ms"] = rtt
+        slot["retrans"] = int(slot["retrans"]) + int(entry.get("retrans") or 0)  # type: ignore[arg-type]
+        slot["tx_queue"] = max(int(slot["tx_queue"]), int(entry.get("tx_queue") or 0))  # type: ignore[arg-type]
+        slot["rx_queue"] = max(int(slot["rx_queue"]), int(entry.get("rx_queue") or 0))  # type: ignore[arg-type]
+        remote = str(entry.get("remote") or "")
+        host = remote.rsplit(":", 1)[0] if remote else ""
+        if host:
+            slot["peers"].add(host)  # type: ignore[union-attr]
+    out = []
+    for slot in by_pid.values():
+        slot["peers"] = len(slot["peers"])  # type: ignore[arg-type]
+        out.append(slot)
+    out.sort(key=lambda s: (-(int(s["send_bytes_sec"]) + int(s["recv_bytes_sec"])),  # type: ignore[arg-type]
+                            -int(s["connections"])))  # type: ignore[arg-type]
+    return out[:40]
+
+
+_SS_FIELDS = {
+    "rtt": "rtt_ms", "minrtt": "rtt_min_ms", "retrans": "retrans",
+    "bytes_sent": "bytes_sent", "bytes_received": "bytes_received",
+    "unacked": "unacked", "lastsnd": "last_send_ms", "lastrcv": "last_recv_ms",
+}
+
+
+def _ss_established() -> tuple[dict[tuple[str, str], dict[str, object]], str | None]:
+    """{(local, peer): tcp_info fields} for every established TCP socket,
+    from one `ss -tinH` (netlink inet_diag; no privilege needed). Second
+    value is the reason when it could not be read."""
+    if not shutil.which("ss"):
+        return {}, "iproute2 (`ss`) is not installed: per-connection RTT, retransmits and byte rates are unknown"
+    try:
+        proc = subprocess.run(["ss", "-tinH"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {}, f"`ss -tin` failed: {exc}"
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip().splitlines()
+        return {}, f"`ss -tin` failed: {err[0] if err else f'exit {proc.returncode}'}"
+    out: dict[tuple[str, str], dict[str, object]] = {}
+    current: tuple[str, str] | None = None
+    queues: tuple[int, int] = (0, 0)
+    for line in proc.stdout.splitlines():
+        if not line.startswith((" ", "\t")):
+            fields = line.split()
+            # ESTAB <recv-q> <send-q> <local> <peer>
+            if len(fields) < 5 or fields[0] != "ESTAB":
+                current = None
+                continue
+            current = (fields[3], fields[4])
+            try:
+                queues = (int(fields[2]), int(fields[1]))
+            except ValueError:
+                queues = (0, 0)
+            out[current] = {"tx_queue": queues[0], "rx_queue": queues[1]}
+            continue
+        if current is None:
+            continue
+        stats = out[current]
+        for token in line.split():
+            key, sep, value = token.partition(":")
+            name = _SS_FIELDS.get(key)
+            if not sep or name is None:
+                continue
+            if key == "rtt":
+                value = value.split("/", 1)[0]
+            elif key == "retrans":
+                value = value.split("/", 1)[-1]   # current/total: keep the total
+            try:
+                number = float(value)
+            except ValueError:
+                continue
+            stats[name] = round(number, 3) if key in ("rtt", "minrtt") else int(number)
+    return out, None
+
+
+def _proc_net_established() -> dict[tuple[str, str], dict[str, object]]:
+    """Queues per established socket from /proc/net/tcp{,6} -- the fallback
+    when `ss` is absent. No RTT or byte counters live there."""
+    out: dict[tuple[str, str], dict[str, object]] = {}
+    for path, family in (("/proc/net/tcp", socket.AF_INET), ("/proc/net/tcp6", socket.AF_INET6)):
+        text = linux.read_text(path)
+        if not text:
+            continue
+        for line in text.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "01":
+                continue
+            try:
+                local = _hex_addr(fields[1], family)
+                remote = _hex_addr(fields[2], family)
+                tx, _, rx = fields[4].partition(":")
+                out[(local, remote)] = {"tx_queue": int(tx, 16), "rx_queue": int(rx, 16),
+                                        "retrans": int(fields[6], 16)}
+            except (ValueError, OSError):
+                continue
+    return out
+
+
+def _hex_addr(text: str, family: int) -> str:
+    """'0100007F:1F90' -> '127.0.0.1:8080' in psutil's formatting."""
+    hex_ip, _, hex_port = text.rpartition(":")
+    port = int(hex_port, 16)
+    if family == socket.AF_INET:
+        ip = socket.inet_ntop(family, struct.pack("<I", int(hex_ip, 16)))
+        return f"{ip}:{port}"
+    words = [int(hex_ip[i:i + 8], 16) for i in range(0, 32, 8)]
+    ip = socket.inet_ntop(family, struct.pack("<IIII", *words))
+    return f"[{ip}]:{port}"
 
 
 def _connectivity(adapters: list[dict[str, object]]) -> dict[str, object]:

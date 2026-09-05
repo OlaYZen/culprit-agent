@@ -383,7 +383,7 @@ class Sampler:
         table = (self.store.get("process_table") or {}).get("processes") or []
         volumes = self.volumes.sample(processes=table)
         services = self.services.sample()
-        net_detail = self.net_detail.sample()
+        net_detail = self.net_detail.sample(processes=table)
         # The port map names the systemd unit behind each listener from the
         # process's own cgroup; the services list turns that unit name into its
         # human description (the blue tag). Both are best-effort and degrade.
