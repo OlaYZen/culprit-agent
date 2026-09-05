@@ -3,7 +3,7 @@
 # `./agent.sh` (without sudo) writes and enables an equivalent of this unit
 # with the folder's real path; this file is the manual alternative:
 #   cd ~/culprit-agent
-#   ./agent.sh --configure                 # asks for host + token, writes agent.json
+#   ./agent.sh --configure                 # asks for host + token, writes ~/.config/culprit-agent/agent.json
 #   mkdir -p ~/.config/systemd/user
 #   cp culprit-agent.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
@@ -22,7 +22,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/culprit-agent
-ExecStart=%h/culprit-agent/.venv/bin/python -m culprit.agent
+Environment=CULPRIT_AGENT_CONFIG=%h/.config/culprit-agent/agent.json
+Environment=CULPRIT_AGENT_DATA=%h/.local/share/culprit-agent
+ExecStart=%h/.local/share/culprit-agent/venv/bin/python -m culprit.agent
 Restart=always
 RestartSec=10
 

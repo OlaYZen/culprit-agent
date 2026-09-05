@@ -3,6 +3,13 @@
 #   1. install    -- create the venv (psutil only)
 #   2. configure  -- the host URL and this node's token, asked for interactively
 #                    and saved to agent.json (chmod 600), so nothing is typed again
+#
+# Nothing is written into this checkout. The venv, the config and the flight
+# recorder live in the running user's XDG directories (root's own under sudo):
+#   venv      ~/.local/share/culprit-agent/venv
+#   config    ~/.config/culprit-agent/agent.json
+#   recorder  ~/.local/share/culprit-agent/flight-recorder.json.gz
+# so `git pull` keeps working for whoever cloned it, sudo or not.
 #   3. run it     -- either set it up as a systemd service (default, it asks),
 #                    or with --run start it here in the foreground
 #
@@ -25,6 +32,21 @@ cd "$(dirname "$0")"
 HERE="$(pwd)"
 PYTHON="${PYTHON:-python3}"
 
+# ---- where the agent keeps its files: never in the checkout -----------------
+# The home comes from the password database for the *effective* user, not
+# $HOME: sudo may or may not reset $HOME, the system unit sets none, and both
+# must land on the same files. XDG variables are honoured when set. The
+# resolved paths are exported so the Python side (and the generated unit)
+# agree with this script exactly.
+OWN_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+OWN_HOME="${OWN_HOME:-$HOME}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$OWN_HOME/.config}/culprit-agent"
+DATA_DIR="${CULPRIT_AGENT_DATA:-${XDG_DATA_HOME:-$OWN_HOME/.local/share}/culprit-agent}"
+VENV="$DATA_DIR/venv"
+export CULPRIT_AGENT_CONFIG="${CULPRIT_AGENT_CONFIG:-$CONFIG_DIR/agent.json}"
+export CULPRIT_AGENT_DATA="$DATA_DIR"
+PY="$VENV/bin/python"
+
 usage() {
     cat <<'USAGE'
 culprit agent -- install, save the host + token, then run it as a systemd
@@ -42,7 +64,9 @@ Usage:
   ./agent.sh -h, --help          show this help
 
 Host and token can also be given on the command line, positionally or as
-flags, in any mode; they are saved to agent.json either way:
+flags, in any mode; they are saved to ~/.config/culprit-agent/agent.json
+either way (root's own ~ under sudo). Nothing is written into this checkout:
+the venv and the flight recorder live in ~/.local/share/culprit-agent.
   ./agent.sh http://192.168.1.1:8787 web-01.<secret>
   ./agent.sh --host https://hub:8787 --token web-01.<secret> --insecure
 
@@ -131,57 +155,71 @@ fi
 # `ModuleNotFoundError: No module named 'psutil'`. So: try to install the deps;
 # if that cannot succeed, rebuild the venv from scratch once; only then give up.
 ensure_deps() {
-    .venv/bin/python -c 'import psutil' 2>/dev/null && return 0
+    "$PY" -c 'import psutil' 2>/dev/null && return 0
     echo "installing agent dependencies (psutil)..."
-    .venv/bin/python -m pip install --quiet --upgrade pip 2>/dev/null || return 1
-    .venv/bin/python -m pip install --quiet -r requirements-agent.txt 2>/dev/null || return 1
-    .venv/bin/python -c 'import psutil' 2>/dev/null
+    "$PY" -m pip install --quiet --upgrade pip 2>/dev/null || return 1
+    "$PY" -m pip install --quiet -r requirements-agent.txt 2>/dev/null || return 1
+    "$PY" -c 'import psutil' 2>/dev/null
 }
 make_venv() {
-    echo "creating agent virtual environment (psutil only)..."
-    "$PYTHON" -m venv .venv
+    echo "creating agent virtual environment in $VENV (psutil only)..."
+    mkdir -p "$DATA_DIR" && chmod 700 "$DATA_DIR" 2>/dev/null || true
+    "$PYTHON" -m venv "$VENV"
 }
 venv_help() {
     echo "error: venv creation failed -- on Debian/Ubuntu: sudo apt install python3-venv" >&2
 }
 
-if [ ! -x .venv/bin/python ]; then
+if [ ! -x "$PY" ]; then
     make_venv || { venv_help; exit 1; }
 fi
 if ! ensure_deps; then
-    echo "existing .venv is incomplete; rebuilding it from scratch..."
-    rm -rf .venv
+    echo "existing venv is incomplete; rebuilding it from scratch..."
+    rm -rf "$VENV"
     make_venv || { venv_help; exit 1; }
     ensure_deps || {
         echo "error: could not install psutil into the agent venv." >&2
         echo "       Check network access (pip needs to reach PyPI), then rerun." >&2
         echo "       Offline hosts: 'sudo apt install python3-psutil' and recreate" >&2
-        echo "       the venv with '$PYTHON -m venv --system-site-packages .venv'." >&2
+        echo "       the venv with '$PYTHON -m venv --system-site-packages $VENV'." >&2
         exit 1
     }
 fi
-if ! .venv/bin/python -c 'import culprit.agent' 2>/dev/null; then
+if ! "$PY" -c 'import culprit.agent' 2>/dev/null; then
     echo "error: the culprit package in this folder does not import; the checkout is incomplete." >&2
     exit 1
 fi
 
-# Under sudo, everything this script creates (.venv, agent.json, data/) is
-# root's, and a `chown -R root` of the checkout used to follow -- which broke
-# `git pull` for the person who cloned it (.git/FETCH_HEAD: Permission
-# denied). Root reads a user-owned bundle just fine, so the checkout is
-# handed back to whoever ran sudo, every time, and only the service is root's.
-reclaim_ownership() {
-    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-        chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$HERE" 2>/dev/null || true
+# ---- leftovers from earlier versions, which wrote into the checkout ---------
+# An old .venv here is no longer used; agent.json and data/ are moved to
+# their XDG homes by the Python side on first load. Under sudo, an earlier
+# version also made the whole checkout root's, which broke `git pull` for
+# the person who cloned it: that is repaired here, once, and never redone.
+if [ -d "$HERE/.venv" ]; then
+    if rm -rf "$HERE/.venv" 2>/dev/null; then
+        echo "  removed the old .venv from the checkout (the venv now lives in $VENV)"
+    else
+        echo "  note: the old .venv in the checkout is no longer used but could not be removed"
+        echo "        (owned by someone else); remove it with: sudo rm -rf $HERE/.venv"
     fi
-}
-reclaim_ownership
+fi
+"$PY" - <<'EOF'
+from culprit.agent import migrate_legacy_files
+migrate_legacy_files()       # moves a legacy agent.json / data/ out of the checkout
+EOF
+[ -d "$HERE/data" ] && rmdir "$HERE/data" 2>/dev/null || true
+if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] \
+        && [ "$(stat -c %U "$HERE/.git" 2>/dev/null)" = "root" ]; then
+    chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$HERE" 2>/dev/null || true
+    echo "  repaired: an earlier version had made this checkout root's; it is $SUDO_USER's again"
+    echo "            (git pull works as $SUDO_USER now; a sudo git pull would make it root's again)"
+fi
 
 # ==============================================================================
 # 2. CONFIGURE  (host URL + token, saved to agent.json)
 # ==============================================================================
 configured() {
-    .venv/bin/python - <<'EOF'
+    "$PY" - <<'EOF'
 import sys
 from culprit.agent import load_agent_config
 cfg = load_agent_config()
@@ -189,7 +227,7 @@ sys.exit(0 if cfg.get("host_url") and cfg.get("token") else 1)
 EOF
 }
 show_config() {
-    .venv/bin/python - <<'EOF'
+    "$PY" - <<'EOF'
 from culprit.agent import CONFIG_PATH, load_agent_config
 cfg = load_agent_config()
 name = str(cfg.get("token", "")).partition(".")[0] or "?"
@@ -198,7 +236,7 @@ print(f"  node '{name}' -> {cfg.get('host_url')}{tls}   [{CONFIG_PATH}]")
 EOF
 }
 save_config() {   # url token insecure interval
-    .venv/bin/python - "$1" "$2" "$3" "$4" <<'EOF'
+    "$PY" - "$1" "$2" "$3" "$4" <<'EOF'
 import sys
 from culprit.agent import CONFIG_PATH, load_agent_config, save_agent_config
 url, token, insecure, interval = sys.argv[1:5]
@@ -219,7 +257,7 @@ EOF
 # the token before it parses the body, so a deliberately invalid body ("[]")
 # answers 401 for a bad token and 400 for a good one, and folds nothing in.
 check_host() {
-    .venv/bin/python - <<'EOF'
+    "$PY" - <<'EOF'
 import gzip, ssl, sys, urllib.error, urllib.request
 from culprit.agent import load_agent_config
 cfg = load_agent_config()
@@ -362,8 +400,7 @@ fi
 # ==============================================================================
 if [ "$MODE" = "run" ]; then
     show_config
-    reclaim_ownership
-    exec .venv/bin/python -m culprit.agent "${ARGS[@]+"${ARGS[@]}"}"
+    exec "$PY" -m culprit.agent "${ARGS[@]+"${ARGS[@]}"}"
 fi
 
 # ==============================================================================
@@ -386,9 +423,9 @@ setup_service() {
     local owner_note=""
     if [ "$AS_ROOT" -eq 1 ]; then
         # Root reads every process's descriptors and IO: that is the point
-        # of running it this way. The bundle stays the invoking user's (see
-        # reclaim_ownership); root needs no ownership to read and run it.
-        reclaim_ownership
+        # of running it this way. Root's files live under root's own home;
+        # the checkout stays whoever's it was, root only reads it.
+        :
     else
         owner_note="  note: as $USER it sees your own processes fully and other users' partly
         (no per-process IO or descriptor counts for them). Run ./agent.sh under
@@ -404,7 +441,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$HERE
-ExecStart=$HERE/.venv/bin/python -m culprit.agent
+Environment=CULPRIT_AGENT_CONFIG=$CULPRIT_AGENT_CONFIG
+Environment=CULPRIT_AGENT_DATA=$CULPRIT_AGENT_DATA
+ExecStart=$PY -m culprit.agent
 Restart=always
 RestartSec=10
 

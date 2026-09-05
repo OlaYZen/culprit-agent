@@ -9,7 +9,7 @@
 # your bundle isn't at /opt/culprit-agent):
 #   sudo cp -r culprit-agent /opt/culprit-agent
 #   cd /opt/culprit-agent
-#   sudo ./agent.sh --configure             # builds .venv, asks for host + token, writes agent.json (root-owned, chmod 600)
+#   sudo ./agent.sh --configure             # builds root's venv, asks for host + token, writes /root/.config/culprit-agent/agent.json (chmod 600)
 #   sudo cp culprit-agent.system.service /etc/systemd/system/culprit-agent.service
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now culprit-agent
@@ -23,7 +23,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/culprit-agent
-ExecStart=/opt/culprit-agent/.venv/bin/python -m culprit.agent
+Environment=CULPRIT_AGENT_CONFIG=/root/.config/culprit-agent/agent.json
+Environment=CULPRIT_AGENT_DATA=/root/.local/share/culprit-agent
+ExecStart=/root/.local/share/culprit-agent/venv/bin/python -m culprit.agent
 Restart=always
 RestartSec=10
 
