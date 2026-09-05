@@ -15,6 +15,15 @@ that leans on the systemd unit's own `Restart=always` (see agent.sh). No
 `systemctl` shell-out, no separate installer, no version-number gate on the
 apply step -- fetch_remote_version() only gates *whether it's worth asking*,
 never whether git actually finds something to reset to.
+
+Every git call passes `-c safe.directory=<ROOT>`: a system service (`sudo
+./agent.sh`) runs as root over a checkout some other user cloned, and git
+2.35.2+ refuses to touch a repository it does not own ("detected dubious
+ownership") unless told to trust that exact path. Without this, every git
+call here fails and _run()'s caller would misreport *why* -- e.g. a dubious-
+ownership error surfacing as "no origin remote configured", which is not
+what is actually wrong. _run() returns the tool's own stderr on failure for
+exactly this reason: a guessed reason is worse than none.
 """
 
 from __future__ import annotations
@@ -36,22 +45,39 @@ _REMOTE_VERSION_URL = (
     "https://raw.githubusercontent.com/OlaYZen/culprit-agent/{branch}/version.json")
 
 
-def _run(argv: list[str], timeout: float) -> str | None:
-    """A git/pip subprocess in the checkout, returning stdout or None on any
-    failure. Never raises -- mirrors linux.run()'s discipline, but this one
-    needs cwd/env, which that shared helper does not take."""
+def _git(*args: str, timeout: float) -> tuple[bool, str]:
+    """A `git -c safe.directory=<ROOT> <args>` call in the checkout.
+    (True, stdout) on success; (False, message) naming exactly why not --
+    the executable missing, a timeout, or git's own stderr verbatim."""
+    argv = ["git", "-c", f"safe.directory={config_module.ROOT}", *args]
     try:
         completed = subprocess.run(
             argv, cwd=config_module.ROOT, env=_GIT_ENV,
             capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log.warning("%s failed: %s", " ".join(argv), exc)
-        return None
+    except FileNotFoundError:
+        return False, "git is not installed on this machine"
+    except subprocess.TimeoutExpired:
+        return False, f"git {args[0]} timed out after {timeout:.0f}s"
+    except OSError as exc:
+        return False, str(exc)
     if completed.returncode != 0:
-        log.warning("%s exited %d: %s", " ".join(argv), completed.returncode,
-                    completed.stderr.strip()[:300])
-        return None
-    return completed.stdout
+        message = completed.stderr.strip().splitlines()[0] if completed.stderr.strip() else \
+            f"git {args[0]} exited {completed.returncode}"
+        return False, message[:300]
+    return True, completed.stdout
+
+
+def _pip(*args: str, timeout: float) -> tuple[bool, str]:
+    argv = [sys.executable, "-m", "pip", *args]
+    try:
+        completed = subprocess.run(
+            argv, cwd=config_module.ROOT, capture_output=True, text=True,
+            timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if completed.returncode != 0:
+        return False, completed.stderr.strip()[:300] or f"pip exited {completed.returncode}"
+    return True, completed.stdout
 
 
 def current_branch() -> str:
@@ -60,8 +86,8 @@ def current_branch() -> str:
     compares against, never assumed capable of anything else."""
     if not (config_module.ROOT / ".git").is_dir():
         return "main"
-    branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], timeout=10)
-    return branch.strip() if branch else "main"
+    ok, out = _git("rev-parse", "--abbrev-ref", "HEAD", timeout=10)
+    return out.strip() if ok and out.strip() else "main"
 
 
 def capability() -> tuple[bool, str | None]:
@@ -74,12 +100,15 @@ def capability() -> tuple[bool, str | None]:
         return False, "not running under systemd (started via --run); nothing would bring it back up"
     if not (config_module.ROOT / ".git").is_dir():
         return False, "checkout has no .git (deployed with cp -r, not git clone)"
-    if not _run(["git", "remote", "get-url", "origin"], timeout=10):
+    ok, out = _git("remote", "get-url", "origin", timeout=10)
+    if not ok:
+        return False, out
+    if not out.strip():
         return False, "no 'origin' remote configured"
-    status = _run(["git", "status", "--porcelain"], timeout=15)
-    if status is None:
-        return False, "git status failed"
-    if status.strip():
+    ok, out = _git("status", "--porcelain", timeout=15)
+    if not ok:
+        return False, out
+    if out.strip():
         return False, "the checkout has local modifications (git status is not clean)"
     return True, None
 
@@ -111,34 +140,34 @@ def perform(cmd_id) -> dict:
     if not capable:
         return _cmd_err(cmd_id, 409, reason or "not capable")
 
-    from_sha = _run(["git", "rev-parse", "HEAD"], timeout=10)
-    if from_sha is None:
-        return _cmd_err(cmd_id, 500, "git rev-parse HEAD failed")
-    from_sha = from_sha.strip()
+    ok, out = _git("rev-parse", "HEAD", timeout=10)
+    if not ok:
+        return _cmd_err(cmd_id, 500, f"git rev-parse HEAD failed: {out}")
+    from_sha = out.strip()
 
-    if _run(["git", "fetch", "--quiet", "origin"], timeout=60) is None:
-        return _cmd_err(cmd_id, 502, "git fetch failed")
+    ok, out = _git("fetch", "--quiet", "origin", timeout=60)
+    if not ok:
+        return _cmd_err(cmd_id, 502, f"git fetch failed: {out}")
 
     branch = current_branch()
-    if _run(["git", "reset", "--hard", "--quiet", f"origin/{branch}"],
-           timeout=30) is None:
-        return _cmd_err(cmd_id, 500, f"git reset --hard origin/{branch} failed")
+    ok, out = _git("reset", "--hard", "--quiet", f"origin/{branch}", timeout=30)
+    if not ok:
+        return _cmd_err(cmd_id, 500, f"git reset --hard origin/{branch} failed: {out}")
 
-    to_sha = _run(["git", "rev-parse", "HEAD"], timeout=10)
-    to_sha = to_sha.strip() if to_sha else from_sha
+    ok, out = _git("rev-parse", "HEAD", timeout=10)
+    to_sha = out.strip() if ok else from_sha
 
     if to_sha == from_sha:
         return {"id": cmd_id, "ok": True,
                 "result": {"updated": False, "sha": to_sha[:12]}}
 
-    pip = _run([sys.executable, "-m", "pip", "install", "--quiet",
-               "-r", "requirements-agent.txt"], timeout=180)
-    if pip is None:
+    ok, out = _pip("install", "--quiet", "-r", "requirements-agent.txt", timeout=180)
+    if not ok:
         # Revert: disk must keep matching what's actually running.
-        _run(["git", "reset", "--hard", "--quiet", from_sha], timeout=30)
+        _git("reset", "--hard", "--quiet", from_sha, timeout=30)
         return _cmd_err(
             cmd_id, 500,
-            f"pip install failed after updating to {to_sha[:12]}; "
+            f"pip install failed after updating to {to_sha[:12]}: {out}; "
             f"reverted to {from_sha[:12]}")
 
     return {"id": cmd_id, "ok": True,
