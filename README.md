@@ -15,17 +15,28 @@ cd culprit-agent
 sudo ./agent.sh
 ```
 
-That is the whole install. `agent.sh` creates a local `.venv` (psutil only),
+That is the whole install. `agent.sh` creates a venv (psutil only) in
+`~/.local/share/culprit-agent/venv`,
 then **asks** for the culprit host's URL and this node's token (get the token
 from the host dashboard: Nodes > "Generate token"; it looks like
 `<name>.<secret>`), checks that the host is reachable and accepts the token,
-saves both to `agent.json` (mode 600) so nothing is typed again, and offers to
+saves both to `~/.config/culprit-agent/agent.json` (mode 600) so nothing is
+typed again, and offers to
 set the agent up as a systemd service that starts on boot and restarts on
 failure. Under `sudo` that is a **system** service running as root, which is
-what reads other users' processes, descriptors and ports (the checkout itself
-stays yours, so `git pull` keeps working); without `sudo` it is
+what reads other users' processes, descriptors and ports; without `sudo` it is
 a **user** service that sees your own processes fully and others partly. The
 agent pushes reports to the host over HTTP(S) and **opens no listening ports**.
+
+**Nothing is written into the checkout.** The venv, the config and the flight
+recorder live in the running user's XDG directories (root's own under `sudo`:
+`/root/.config/culprit-agent`, `/root/.local/share/culprit-agent`), so a plain
+`git pull` keeps working for whoever cloned it. Earlier versions wrote
+`.venv`, `agent.json` and `data/` into the checkout and, under `sudo`, made
+the whole checkout root's; the next `./agent.sh` moves those files to their
+new homes and gives the checkout back. Avoid `sudo git pull`: git as root in
+a directory it does not own refuses with "dubious ownership", and if forced it
+leaves root-owned files behind that break the next plain `git pull`.
 
 Other ways to run it:
 
@@ -156,7 +167,13 @@ docker/entrypoint.sh          maps the CULPRIT_* env vars onto the agent CLI
 sync-package.sh               maintainer tool: refresh culprit/ from the repo
 culprit/                      a copy of the runnable package (collectors, sampler,
                               db, state, config, linux, util, agent)
-data/flight-recorder.json.gz  the flight recorder: the last ten minutes, rewritten every
+
+Outside the checkout, per running user (root's own under sudo):
+
+~/.config/culprit-agent/agent.json          host URL + token, mode 600
+~/.local/share/culprit-agent/venv           the agent's virtual environment
+~/.local/share/culprit-agent/flight-recorder.json.gz
+                              the flight recorder: the last ten minutes, rewritten every
                               five seconds; read at the next start to report a death
                               (a crash, a hang, a power cut, a kill) to the host's Coroner
 ```

@@ -13,13 +13,13 @@ A self-contained, report-only monitoring agent for the [culprit](https://github.
 There is no test suite, linter config, or `pyproject.toml` in this repo.
 
 ```bash
-# First run: create .venv, install psutil, save agent.json, start the agent
+# First run: create the venv (~/.local/share/culprit-agent/venv), install psutil, save agent.json, start the agent
 ./agent.sh <host-url> <name>.<secret>
 ./agent.sh --insecure https://hub:8787 <token>   # self-signed host cert
 
 # Subsequent runs (config comes from agent.json)
 ./agent.sh
-.venv/bin/python -m culprit.agent --log-level debug
+~/.local/share/culprit-agent/venv/bin/python -m culprit.agent --log-level debug
 
 # Refresh culprit/ from the host repo (maintainers)
 ./sync-package.sh
@@ -28,10 +28,10 @@ There is no test suite, linter config, or `pyproject.toml` in this repo.
 docker build -t culprit-agent .
 
 # Quick import/version sanity check
-.venv/bin/python -c "import culprit; print(culprit.__version__)"
+~/.local/share/culprit-agent/venv/bin/python -c "import culprit; print(culprit.__version__)"
 ```
 
-`agent.json` (host URL + token, chmod 600) lives at the repo root and is gitignored. The agent reads collector thresholds from `config.py` defaults; there is no `config.json` UI on an agent.
+`agent.json` (host URL + token, chmod 600) lives in `~/.config/culprit-agent/` of the running user (root's own under sudo; `CULPRIT_AGENT_CONFIG` overrides it, and the generated unit sets it), the venv and the flight recorder in `~/.local/share/culprit-agent/` (`CULPRIT_AGENT_DATA`). Nothing the agent or `agent.sh` writes lands in the checkout; a legacy `agent.json` / `data/` in the checkout is moved on first load and an old `.venv` removed. The agent reads collector thresholds from `config.py` defaults; there is no `config.json` UI on an agent.
 
 ## Commits
 
@@ -57,7 +57,7 @@ Sampler (4 loops)  -->  Store (latest payload per section)  -->  Reporter.push()
 
 ### Reporter behaviour worth knowing
 
-- **The flight recorder and deaths.** `run_agent` reads `data/flight-recorder.json.gz` (`recorder.detect_death`) *before* starting the sampler, then runs the sampler with a fresh `FlightRecorder` on the same path. A recording without a clean stop is a death: `_report_death` runs `forensics.investigate` in a thread and puts `{"coroner": {"deaths": [record]}}` in the store; `Reporter.push` clears it after the first successful report, so it costs one report. `Sampler.stop` marks the file `clean_stop` on SIGTERM/SIGINT, so a routine restart is never a death. The `data/` directory must be writable and survive reboots (it is in the checkout, next to `agent.json`).
+- **The flight recorder and deaths.** `run_agent` reads `data/flight-recorder.json.gz` (`recorder.detect_death`) *before* starting the sampler, then runs the sampler with a fresh `FlightRecorder` on the same path. A recording without a clean stop is a death: `_report_death` runs `forensics.investigate` in a thread and puts `{"coroner": {"deaths": [record]}}` in the store; `Reporter.push` clears it after the first successful report, so it costs one report. `Sampler.stop` marks the file `clean_stop` on SIGTERM/SIGINT, so a routine restart is never a death. The data directory (`agent.data_dir()`, `~/.local/share/culprit-agent`) must be writable and survive reboots.
 - **Delta reports.** Large sections listed in `_DELTA_SECTIONS` are only resent when the sampler has replaced the object (identity check via `id()`), so a 1s cadence costs a few KB/s. A full snapshot goes out every `_FULL_SYNC_S` (60s) regardless, and whenever the host replies `known: false`.
 - **Backoff, never death.** Failures retry with exponential backoff capped at 60s; sampling continues throughout. 401/403 logs a re-enroll hint and keeps crawling.
 - **Host-relayed commands.** The host's reply may carry `commands` (`process_detail`, `terminate`, `priority`, `throttle`) and `settings` (`interval_fast`). Commands run against the live `ProcessCollector` and results are POSTed back immediately in a results-only report. Process actions are gated by `Config.allow_process_actions`. Settings apply to the running sampler only and are never persisted.
@@ -68,5 +68,5 @@ Each module in `culprit/collectors/` owns one domain and is stateful on purpose 
 
 ### Deployment surfaces
 
-- **Native:** `agent.sh` + `culprit-agent.service` (systemd user unit) or `culprit-agent.system.service` (system unit as root, full port/process attribution). Both assume the bundle root as `WorkingDirectory`, which is why `version.json` and `agent.json` resolve relative to the package's parent directory (`config.ROOT`).
+- **Native:** `agent.sh` + `culprit-agent.service` (systemd user unit) or `culprit-agent.system.service` (system unit as root, full port/process attribution). Both assume the bundle root as `WorkingDirectory`, which is why `version.json` resolves relative to the package's parent directory (`config.ROOT`); the config and data paths come from the `CULPRIT_AGENT_*` environment the unit sets.
 - **Docker:** `Dockerfile` copies `version.json` and `culprit/` into `/app`; `docker/entrypoint.sh` maps `CULPRIT_HOST`, `CULPRIT_TOKEN` (or `CULPRIT_TOKEN_FILE`), `CULPRIT_INTERVAL`, `CULPRIT_INSECURE`, `CULPRIT_LOG_LEVEL` onto CLI flags. The container must run `--privileged --pid host --network host` with the mounts listed in the README to see the host; without them the collectors degrade per-source rather than fail. `.github/workflows/docker-publish.yml` builds multi-arch and pushes to `ghcr.io/olayzen/culprit-agent` on every push to `main` and on `v*` tags.
