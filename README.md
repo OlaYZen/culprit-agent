@@ -22,7 +22,8 @@ from the host dashboard: Nodes > "Generate token"; it looks like
 saves both to `agent.json` (mode 600) so nothing is typed again, and offers to
 set the agent up as a systemd service that starts on boot and restarts on
 failure. Under `sudo` that is a **system** service running as root, which is
-what reads other users' processes, descriptors and ports; without `sudo` it is
+what reads other users' processes, descriptors and ports (the checkout itself
+stays yours, so `git pull` keeps working); without `sudo` it is
 a **user** service that sees your own processes fully and others partly. The
 agent pushes reports to the host over HTTP(S) and **opens no listening ports**.
 
