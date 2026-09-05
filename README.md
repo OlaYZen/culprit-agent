@@ -155,6 +155,9 @@ docker/entrypoint.sh          maps the CULPRIT_* env vars onto the agent CLI
 sync-package.sh               maintainer tool: refresh culprit/ from the repo
 culprit/                      a copy of the runnable package (collectors, sampler,
                               db, state, config, linux, util, agent)
+data/flight-recorder.json.gz  the flight recorder: the last ten minutes, rewritten every
+                              five seconds; read at the next start to report a death
+                              (a crash, a hang, a power cut, a kill) to the host's Coroner
 ```
 
 ## Keeping the package copy in sync (maintainers only)
