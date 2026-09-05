@@ -41,7 +41,20 @@ Commit messages carry **no attribution trailers, ever**: no `Co-Authored-By: Cla
 
 ## Versioning
 
-The version is a plain string in `version.json` at the repo root, e.g. `{"version": "0.2-b"}`. `culprit/__init__.py` reads it at import time and falls back to `"unknown"`. Bump only `version.json`. The Dockerfile copies it into the image explicitly, so do not drop that `COPY` line.
+The version is a plain string in `version.json` at the repo root, e.g. `{"version": "0.17.3-b"}`. `culprit/__init__.py` reads it at import time and falls back to `"unknown"`. Bump only `version.json`. The Dockerfile copies it into the image explicitly, so do not drop that `COPY` line.
+
+**Format: `X.Y.Z-b`.** The `-b` (beta) suffix is constant while the project is pre-1.0; do not drop it.
+
+- **X -- proud.** Reserved for a change the maintainer considers massive. Never bump this yourself; only bump it when explicitly told to.
+- **Y -- decent.** A real new capability or user-facing improvement (typically a `feat` commit, or a tightly-coupled group of commits that only add up to one shippable feature together -- e.g. a collector + its doctor finding + the agent wiring that reports it). Resets Z to 0.
+- **Z -- fix/tiny.** A `fix` commit, or any other genuinely small change. Increments from the current Z.
+
+**Bump inline, in the commit that earns it -- never a separate `chore: bump version` commit.** The old pattern of batching several feats into one trailing version-bump commit is retired: it let `version.json` sit stale (still describing the last release) for however many commits came before the bump. Instead:
+
+- When a commit (or the last commit of a coupled feature group) ships a decent update, that same commit's diff includes the `version.json` edit: bump Y, reset Z to 0.
+- When a `fix` commit lands, that same commit's diff bumps Z by 1.
+- `docs` commits and `chore` commits that carry no semantic change (e.g. a sync exclusion, a `.gitignore` tweak) never touch `version.json` -- it simply carries forward unchanged.
+- This means `version.json` should always match the state of the code at HEAD, on every single commit, not just at release boundaries. Before committing a `feat` or `fix`, bump `version.json` in the same commit; if you're not sure whether a change is Y- or Z-sized, treat a new capability as Y and a repair of existing behavior as Z.
 
 ## Architecture
 
