@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import pwd
+import re
 import time
 
 from .. import linux
@@ -33,13 +34,18 @@ log = logging.getLogger("culprit.services")
 # Unit properties fetched in one batched `systemctl show` call.
 _PROPS = ("Id,Description,LoadState,ActiveState,SubState,UnitFileState,"
           "MainPID,ExecMainStatus,NRestarts,Result,Type,RemainAfterExit,"
-          "ActiveEnterTimestamp,InactiveEnterTimestamp,ExecMainExitTimestamp,"
-          "ConditionResult,ControlGroup,User,WantedBy")
+          "ActiveEnterTimestamp,InactiveEnterTimestamp,ExecMainStartTimestamp,"
+          "ExecMainExitTimestamp,ConditionResult,ControlGroup,User,WantedBy")
 
 # A unit that ran at boot and exited cleanly within this many seconds of it
 # did its job (dmesg.service saving the boot log, a one-off setup script
 # declared Type=simple): not a daemon that is missing.
 _BOOT_JOB_WINDOW_S = 900.0
+# A main process that exits 0 within this long of starting is a job that
+# ran to completion, whenever it was started -- by boot or by hand. A
+# daemon stopped by hand had run for hours; a daemon that dies seconds
+# after every start trips the restart-loop rule instead.
+_JOB_MAX_RUN_S = 120.0
 # Targets that only the boot sequence reaches: a unit pulled in by nothing
 # but these has no reason to be running later.
 _BOOT_TARGETS = frozenset({"sysinit.target", "basic.target", "local-fs.target",
@@ -56,7 +62,7 @@ class ServiceCollector:
         # unit -> when its last run ended, from the journal: systemd unloads
         # an inactive unit and `systemctl show` then reports no timestamps,
         # so a boot job that finished needs its journal line to prove it.
-        self._exit_cache: dict[str, float | None] = {}
+        self._exit_cache: dict[str, tuple[float | None, float | None]] = {}
 
     def sample(self) -> dict[str, object]:
         system = self._scope("system")
@@ -80,8 +86,8 @@ class ServiceCollector:
             if _boot_job_candidate(service) and service.get("exited_at") is None:
                 name = str(service["name"])
                 if name not in self._exit_cache:
-                    self._exit_cache[name] = _journal_exit(name, str(service.get("scope")))
-                service["exited_at"] = self._exit_cache[name]
+                    self._exit_cache[name] = _journal_run(name, str(service.get("scope")))
+                service["started_at"], service["exited_at"] = self._exit_cache[name]
             elif service.get("active_state") != "inactive":
                 self._exit_cache.pop(str(service["name"]), None)
         problems = _find_problems(services, boot_time=boot_time)
@@ -228,6 +234,7 @@ class ServiceCollector:
                 "inactive_since": _parse_stamp(detail.get("InactiveEnterTimestamp")),
                 # When the main process ended on its own; empty while it runs,
                 # for a unit that never ran, and for one systemd has unloaded.
+                "started_at": _parse_stamp(detail.get("ExecMainStartTimestamp")),
                 "exited_at": _parse_stamp(detail.get("ExecMainExitTimestamp")),
                 "wanted_by": (detail.get("WantedBy") or "").split(),
             }
@@ -379,38 +386,69 @@ def _boot_job_candidate(service: dict) -> bool:
 
 
 def _finished_boot_job(service: dict, boot_time: float | None) -> bool:
-    """Ran at boot, exited 0 by itself, within the boot window: a job that
-    finished, not a daemon that died. A daemon stopped by hand days later
-    has the same result but an exit time far from boot, and stays a problem.
+    """A job that ran to completion, not a daemon that died or was stopped.
 
-    The exit time comes from systemd's properties while the unit is still
-    loaded, else from the unit's own journal line ("Finished ...",
-    "Deactivated successfully"). With neither, a unit that only the boot
-    targets pull in (WantedBy=sysinit.target) is a boot job by its wiring:
-    nothing later would ever start it.
+    The evidence, in order: a main process that exited 0 within two minutes
+    of starting is a job whenever it was started (dmesg.service saving the
+    boot log takes a second, and someone re-running it by hand does not make
+    it a daemon); Type=idle is the boot-time convenience type and never a
+    daemon; an exit within the boot window is a boot job; and with no times
+    at all, a unit that only the boot targets pull in is a boot job by its
+    wiring. A daemon stopped by hand ran for hours before its clean exit and
+    is wanted by multi-user.target, so it fails every test and stays a
+    problem. Times come from systemd's properties while the unit is loaded,
+    else from the unit's own journal lines.
     """
     if service.get("result") != "success" or service.get("exit_status") != 0:
         return False
+    if service.get("type") == "idle":
+        return True
+    started = service.get("started_at")
     exited = service.get("exited_at")
-    if isinstance(exited, (int, float)) and boot_time:
-        return 0 <= exited - boot_time <= _BOOT_JOB_WINDOW_S
+    if isinstance(exited, (int, float)):
+        if isinstance(started, (int, float)) and 0 <= exited - started <= _JOB_MAX_RUN_S:
+            return True
+        if boot_time and 0 <= exited - boot_time <= _BOOT_JOB_WINDOW_S:
+            return True
+        return False
     wanted = service.get("wanted_by") or []
     return bool(wanted) and all(target in _BOOT_TARGETS for target in wanted)
 
 
-def _journal_exit(name: str, scope: str) -> float | None:
-    """When the unit's last run in this boot ended, from systemd's own line
-    in the unit's journal (~20 ms, once per unit while it stays inactive)."""
+_STARTED_LINE = re.compile(r"^(Started |Starting )")
+_ENDED_LINE = re.compile(r"Finished |Deactivated successfully|Succeeded\.")
+
+
+def _journal_run(name: str, scope: str) -> tuple[float | None, float | None]:
+    """(started, ended) of the unit's last run in this boot, from systemd's
+    own lines in the unit's journal (~20 ms, once per unit while it stays
+    inactive): the way to time a run systemd has already unloaded."""
     match = ["--user-unit", name] if scope == "user" else ["-u", name]
-    entries = linux.journalctl_json(["-b", *match, "-g", _FINISHED_LINE],
-                                    timeout=10, max_entries=1)
-    if not entries:
-        return None
-    raw = entries[0].get("_SOURCE_REALTIME_TIMESTAMP") or entries[0].get("__REALTIME_TIMESTAMP")
-    try:
-        return int(raw) / 1e6
-    except (TypeError, ValueError):
-        return None
+    entries = linux.journalctl_json(["-b", *match, "_COMM=systemd"], timeout=10,
+                                    max_entries=12)
+    ended: float | None = None
+    started: float | None = None
+    for entry in entries:            # newest first
+        message = entry.get("MESSAGE")
+        if isinstance(message, list):
+            try:
+                message = bytes(message).decode("utf-8", "replace")
+            except (TypeError, ValueError):
+                message = ""
+        message = str(message or "")
+        raw = entry.get("_SOURCE_REALTIME_TIMESTAMP") or entry.get("__REALTIME_TIMESTAMP")
+        try:
+            ts = int(raw) / 1e6
+        except (TypeError, ValueError):
+            continue
+        if ended is None:
+            if _ENDED_LINE.search(message):
+                ended = ts
+            continue
+        if _STARTED_LINE.search(message):
+            started = ts
+            break
+    return started, ended
 
 
 def _boot_time() -> float | None:
