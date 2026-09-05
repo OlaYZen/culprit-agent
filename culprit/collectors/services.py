@@ -33,7 +33,13 @@ log = logging.getLogger("culprit.services")
 # Unit properties fetched in one batched `systemctl show` call.
 _PROPS = ("Id,Description,LoadState,ActiveState,SubState,UnitFileState,"
           "MainPID,ExecMainStatus,NRestarts,Result,Type,RemainAfterExit,"
-          "ActiveEnterTimestamp,ConditionResult,ControlGroup,User")
+          "ActiveEnterTimestamp,InactiveEnterTimestamp,ExecMainExitTimestamp,"
+          "ConditionResult,ControlGroup,User")
+
+# A unit that ran at boot and exited cleanly within this many seconds of it
+# did its job (dmesg.service saving the boot log, a one-off setup script
+# declared Type=simple): not a daemon that is missing.
+_BOOT_JOB_WINDOW_S = 900.0
 
 
 class ServiceCollector:
@@ -59,7 +65,7 @@ class ServiceCollector:
                     "timers": []}
 
         services = system["services"] + user["services"]
-        problems = _find_problems(services)
+        problems = _find_problems(services, boot_time=_boot_time())
         problems.sort(key=lambda p: (0 if p["severity"] == "critical" else 1,
                                      str(p["display_name"] or p["name"])))
 
@@ -200,6 +206,10 @@ class ServiceCollector:
                 "remain_after_exit": detail.get("RemainAfterExit") == "yes",
                 "condition_result": detail.get("ConditionResult"),
                 "since": _parse_stamp(detail.get("ActiveEnterTimestamp")),
+                "inactive_since": _parse_stamp(detail.get("InactiveEnterTimestamp")),
+                # When the main process ended on its own; empty while it runs
+                # and for a unit that never ran.
+                "exited_at": _parse_stamp(detail.get("ExecMainExitTimestamp")),
             }
             entry.update(self._cgroup_usage(name, detail.get("ControlGroup"), now))
             services.append(entry)
@@ -287,13 +297,17 @@ def _status_of(active: str, sub: str) -> str:
     return "stopped"
 
 
-def _find_problems(services: list[dict]) -> list[dict[str, object]]:
+def _find_problems(services: list[dict],
+                   boot_time: float | None = None) -> list[dict[str, object]]:
     """Derived from unit properties, not from a curated name list.
 
     A oneshot with RemainAfterExit=no is *supposed* to be inactive after its
-    work; a unit whose start condition was false never intended to run. What
-    is left -- failures, restart loops, enabled long-running services that are
-    not running -- is worth looking at.
+    work; a unit whose start condition was false never intended to run; and a
+    unit that started at boot and exited 0 on its own within the boot window
+    (dmesg.service saving the boot log, a setup script someone declared
+    Type=simple) did its job -- the exit status and the exit time are
+    systemd's own record of that. What is left -- failures, restart loops,
+    enabled long-running services that are not running -- is worth looking at.
     """
     problems = []
     for service in services:
@@ -324,12 +338,33 @@ def _find_problems(services: list[dict]) -> list[dict[str, object]]:
                 and service["active_state"] == "inactive"
                 and not (service.get("type") == "oneshot"
                          and not service.get("remain_after_exit"))
-                and service.get("condition_result") != "no"):
+                and service.get("condition_result") != "no"
+                and not _finished_boot_job(service, boot_time)):
             problems.append(_problem(
                 service, "warn",
                 "Enabled to start at boot but is not running, and it is not a "
                 "oneshot that legitimately exits."))
     return problems
+
+
+def _finished_boot_job(service: dict, boot_time: float | None) -> bool:
+    """Ran at boot, exited 0 by itself, within the boot window: a job that
+    finished, not a daemon that died. A daemon stopped by hand days later
+    has the same result but an exit time far from boot, and stays a problem."""
+    if service.get("result") != "success" or service.get("exit_status") != 0:
+        return False
+    exited = service.get("exited_at")
+    if not isinstance(exited, (int, float)) or not boot_time:
+        return False
+    return 0 <= exited - boot_time <= _BOOT_JOB_WINDOW_S
+
+
+def _boot_time() -> float | None:
+    try:
+        import psutil
+        return float(psutil.boot_time())
+    except Exception:  # noqa: BLE001 -- no boot time, no boot window
+        return None
 
 
 def _problem(service: dict, severity: str, detail: str) -> dict[str, object]:
