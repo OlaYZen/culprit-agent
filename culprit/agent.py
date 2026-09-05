@@ -8,9 +8,10 @@ standard library, which is what makes an agent cheap to drop on many servers.
 
     python -m culprit.agent --host https://hub:8787 --token <name>.<secret>
 
-The first run writes agent.json next to the code (chmod 600 -- it holds the
-token); after that a bare `python -m culprit.agent` is enough, which is what
-the systemd unit runs.
+The first run writes agent.json to the running user's config directory
+(~/.config/culprit-agent/agent.json, chmod 600 -- it holds the token); after
+that a bare `python -m culprit.agent` is enough, which is what the systemd
+unit runs. Nothing is written into the checkout.
 
 Push, not pull, on purpose: an agent only needs *outbound* reachability to the
 host, so nothing new listens on the monitored servers and NAT/firewalls in the
@@ -27,6 +28,8 @@ import gzip
 import json
 import logging
 import os
+import pwd
+import shutil
 import signal
 import ssl
 import sys
@@ -45,10 +48,72 @@ from .state import Broker, Store
 
 log = logging.getLogger("culprit.agent")
 
-CONFIG_PATH = config_module.ROOT / "agent.json"
+
+# ------------------------------------------------------------------ paths
+# Nothing the agent writes lives in the checkout. It used to (agent.json,
+# .venv, data/), and under sudo that left root-owned files in a directory the
+# person who cloned it still wanted to `git pull`. So the config and the
+# flight recorder live in the running user's XDG directories -- root's own
+# when the service runs as root -- and the checkout is only ever read:
+#
+#   config     $XDG_CONFIG_HOME/culprit-agent/agent.json   (~/.config/...)
+#   recorder   $XDG_DATA_HOME/culprit-agent/flight-recorder.json.gz  (~/.local/share/...)
+#
+# The home is the effective user's from the password database, not $HOME:
+# under sudo and under a system unit both must resolve to the same place.
+# CULPRIT_AGENT_CONFIG / CULPRIT_AGENT_DATA override either (the generated
+# unit sets them, so the service and `agent.sh --configure` always agree).
+def _home() -> Path:
+    try:
+        return Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except (KeyError, OSError):
+        return Path.home()
+
+
+def config_path() -> Path:
+    override = os.environ.get("CULPRIT_AGENT_CONFIG")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_CONFIG_HOME") or (_home() / ".config")
+    return Path(base) / "culprit-agent" / "agent.json"
+
+
+def data_dir() -> Path:
+    override = os.environ.get("CULPRIT_AGENT_DATA")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_DATA_HOME") or (_home() / ".local" / "share")
+    return Path(base) / "culprit-agent"
+
+
+CONFIG_PATH = config_path()
 # The flight recorder: the last ten minutes, rewritten every few seconds, so
 # the next start can say how the previous run ended (see collectors/recorder.py).
-RECORDER_PATH = config_module.ROOT / "data" / "flight-recorder.json.gz"
+RECORDER_PATH = data_dir() / "flight-recorder.json.gz"
+# Where earlier versions kept them, inside the checkout: moved on first sight.
+LEGACY_CONFIG_PATH = config_module.ROOT / "agent.json"
+LEGACY_RECORDER_PATH = config_module.ROOT / "data" / "flight-recorder.json.gz"
+
+
+def _migrate(legacy: Path, target: Path, mode: int) -> None:
+    """Move a file an earlier version wrote into the checkout to its XDG
+    home, once. A copy that cannot be removed (root-owned, we are not) is
+    left behind and named; the new location wins from then on."""
+    if target.exists() or not legacy.exists():
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copyfile(legacy, target)
+        os.chmod(target, mode)
+    except OSError as exc:
+        log.warning("could not move %s to %s: %s", legacy, target, exc)
+        return
+    try:
+        legacy.unlink()
+        log.info("moved %s to %s", legacy, target)
+    except OSError:
+        log.warning("moved %s to %s but could not remove the old copy (owned by "
+                    "someone else?); delete it by hand", legacy, target)
 
 _DEFAULTS = {
     "host_url": "",            # e.g. https://hub.example:8787
@@ -69,8 +134,18 @@ _DELTA_SECTIONS = ("process_table", "diagnosis", "services", "volumes",
 _FULL_SYNC_S = 60.0
 
 
+def migrate_legacy_files() -> None:
+    """Move whatever an earlier version left in the checkout (agent.json and
+    the flight recorder) to their XDG homes. Called at every start and by
+    agent.sh, so the checkout ends up clean whichever runs first."""
+    _migrate(LEGACY_CONFIG_PATH, CONFIG_PATH, 0o600)
+    _migrate(LEGACY_RECORDER_PATH, RECORDER_PATH, 0o600)
+
+
 def load_agent_config(path: Path = CONFIG_PATH) -> dict:
     cfg = dict(_DEFAULTS)
+    if path == CONFIG_PATH:
+        _migrate(LEGACY_CONFIG_PATH, path, 0o600)
     if path.exists():
         try:
             cfg.update({k: v for k, v in json.loads(path.read_text()).items()
@@ -81,6 +156,7 @@ def load_agent_config(path: Path = CONFIG_PATH) -> dict:
 
 
 def save_agent_config(cfg: dict, path: Path = CONFIG_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(json.dumps(cfg, indent=2) + "\n")
     os.chmod(path, 0o600)  # the token lives in here
 
@@ -301,6 +377,7 @@ async def run_agent(cfg: dict) -> int:
     history = History(config_module.DEFAULT_DB_PATH, enabled=False)
     # Before anything else: did the previous run end badly? The recording on
     # disk is read before a new recorder overwrites it.
+    migrate_legacy_files()
     death = recorder_mod.detect_death(RECORDER_PATH, recorder_mod.boot_id())
     flight = recorder_mod.FlightRecorder(RECORDER_PATH)
     sampler = Sampler(store, broker, history, recorder=flight)
