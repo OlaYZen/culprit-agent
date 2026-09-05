@@ -3,7 +3,7 @@
 # self-contained agent stays in sync after edits to shared code (collectors,
 # sampler, db, state, config, linux, util). Host-only modules
 # (main.py/auth.py/nodes.py/__main__.py) are never copied; the agent-only
-# agent.py is preserved.
+# agent.py and updater.py are preserved.
 #
 # The host repo (github.com/OlaYZen/culprit) is expected as a SIBLING checkout,
 # so its package is ../culprit/culprit. Override with CULPRIT_SRC=/path/to/culprit
@@ -24,10 +24,10 @@ fi
 
 rsync -a --delete \
   --exclude='main.py' --exclude='auth.py' --exclude='nodes.py' \
-  --exclude='__main__.py' --exclude='agent.py' \
+  --exclude='__main__.py' --exclude='agent.py' --exclude='updater.py' \
   --exclude='expect.py' --exclude='notify.py' --exclude='verdict.py' \
   --exclude='coroner.py' --exclude='fleetmap.py' --exclude='portnames.py' \
   --exclude='__init__.py' \
   --exclude='__pycache__' --exclude='*.pyc' \
   "$src/" "$here/culprit/"
-echo "synced $src -> $here/culprit (agent.py preserved, host-only files skipped)"
+echo "synced $src -> $here/culprit (agent.py/updater.py preserved, host-only files skipped)"

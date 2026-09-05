@@ -103,6 +103,11 @@ class Config:
     # every call goes through a confirmation modal and is refused for PID 0/4
     # and the critical-service allowlist. Set false for a read-only install.
     allow_process_actions: bool = True
+    # Remote git-pull + restart, gated the same way as allow_process_actions:
+    # an agent honours its own copy of this field (hand-edited in its local
+    # config.json), so one machine can opt out of remote updates even though
+    # it is otherwise capable (systemd, a clean git checkout, not Docker).
+    allow_remote_update: bool = True
 
     # --- agent deployment -------------------------------------------------
     # Shape the deploy command the Nodes view shows for a freshly enrolled or
@@ -112,6 +117,14 @@ class Config:
     # run the agent as root, which unlocks full port/process attribution.
     deploy_host: str = ""            # e.g. "192.168.1.1:8787" or "https://hub:8787"
     agent_command: str = "./agent.sh"
+
+    # --- agent auto-update (host only) -------------------------------------
+    # The host decides *when*; the agent is only ever told "update now" (same
+    # CommandBroker channel as a process action), never handed this schedule
+    # itself. Fires at most once a day per node, and only for a node whose
+    # last report says it is update_capable and update_available.
+    auto_update_enabled: bool = False
+    auto_update_hour: int = 3        # 0-23, host-local time
 
     # --- network trust ----------------------------------------------------
     # Reverse proxies are refused until declared: a request that carries a
@@ -194,8 +207,9 @@ EDITABLE = {
     "weight_cpu", "weight_memory", "weight_disk", "weight_gpu",
     "weight_faults", "weight_stuck",
     "event_lookback_days", "event_max_per_source",
-    "allow_process_actions", "open_browser", "ui",
+    "allow_process_actions", "allow_remote_update", "open_browser", "ui",
     "deploy_host", "agent_command",
+    "auto_update_enabled", "auto_update_hour",
     "trusted_proxies", "trusted_hosts",
     "notify_ntfy_url", "notify_webhook_url", "notify_smtp_host",
     "notify_smtp_port", "notify_smtp_user", "notify_smtp_password",
@@ -276,6 +290,7 @@ LIMITS: dict[str, tuple[float, float]] = {
     "event_lookback_days": (1, 3650),
     "event_max_per_source": (10, 5000),
     "notify_smtp_port": (1, 65535),
+    "auto_update_hour": (0, 23),
 }
 
 

@@ -34,5 +34,11 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # Config comes from the environment (CULPRIT_HOST, CULPRIT_TOKEN, optional
 # CULPRIT_INTERVAL / CULPRIT_INSECURE / CULPRIT_LOG_LEVEL); the entrypoint turns
 # them into the agent's CLI arguments. `python -u` for unbuffered logs.
+#
+# CULPRIT_AGENT_DOCKER marks this image so culprit/updater.py's capability
+# check names the real reason a remote update is refused ("running in the
+# Docker image") -- the image has no .git anyway, but that would report the
+# wrong reason (it reads as a cp -r bundle, not a container).
 ENV PYTHONUNBUFFERED=1
+ENV CULPRIT_AGENT_DOCKER=1
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -40,6 +40,7 @@ from pathlib import Path
 
 from . import __version__
 from . import config as config_module
+from . import updater
 from .collectors import forensics
 from .collectors import recorder as recorder_mod
 from .db import History
@@ -162,6 +163,8 @@ def save_agent_config(cfg: dict, path: Path = CONFIG_PATH) -> None:
 
 
 class Reporter:
+    _CAPABILITY_RECHECK_S = 300.0
+
     def __init__(self, store: Store, cfg: dict) -> None:
         self.store = store
         self.url = cfg["host_url"].rstrip("/") + "/api/agents/report"
@@ -182,6 +185,19 @@ class Reporter:
         # Set after the sampler starts; the process collector the host's
         # relayed commands run against.
         self.proc = None
+        # Self-update state: recomputed on a slow cadence (see push()), never
+        # on every report -- a git-fetch-less capability check is cheap but a
+        # GitHub round trip every second is not. Set from run_agent() once
+        # the event loop exists, so a completed "update" command can ask for
+        # a clean restart from the executor thread it actually runs in.
+        self._update_capable: bool | None = None
+        self._update_reason: str | None = None
+        self._remote_version: str | None = None
+        self._update_available: bool | None = None
+        self._last_capability_check = 0.0
+        self._restart_after_post = False
+        self.loop = None
+        self.stopping = None
 
     def _build_snapshot(self) -> dict:
         """Full snapshot, or just the sections that changed since the last
@@ -218,14 +234,34 @@ class Reporter:
                                     context=self._context) as response:
             return json.loads(response.read() or b"{}")
 
+    def _refresh_update_state(self) -> None:
+        """Recomputed every _CAPABILITY_RECHECK_S, not every report: a fresh
+        install reports it immediately (_last_capability_check starts at 0),
+        after that a git-status check plus one GitHub GET every few minutes
+        is plenty for a schedule/button that fires at most a few times a day."""
+        now = time.monotonic()
+        if now - self._last_capability_check < self._CAPABILITY_RECHECK_S:
+            return
+        self._last_capability_check = now
+        self._update_capable, self._update_reason = updater.capability()
+        self._remote_version, _ = updater.fetch_remote_version(
+            updater.current_branch())
+        self._update_available = (self._remote_version is not None and
+                                  self._remote_version != __version__)
+
     def push(self) -> bool:
         """One report. Runs in a thread (urllib blocks)."""
+        self._refresh_update_state()
         payload = {
             "agent": {
                 "name": self.node_name,
                 "version": __version__,
                 "report_interval": self.interval,
                 "interval_fast": config_module.get().interval_fast,
+                "update_capable": self._update_capable,
+                "update_reason": self._update_reason,
+                "update_available": self._update_available,
+                "remote_version": self._remote_version,
             },
             "snapshot": self._build_snapshot(),
         }
@@ -288,6 +324,15 @@ class Reporter:
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             log.warning("could not return %d command result(s): %s",
                         len(results), exc)
+        if self._restart_after_post:
+            # Fires even if the ack above failed to reach the host: the git
+            # reset already landed on disk by this point, so not restarting
+            # would strand the process on stale in-memory code -- the next
+            # attempt would see "already up to date" and never try again.
+            self._restart_after_post = False
+            log.warning("update applied; restarting for the new code to take effect")
+            if self.loop is not None and self.stopping is not None:
+                self.loop.call_soon_threadsafe(self.stopping.set)
 
     def _execute(self, command: dict) -> dict:
         from .collectors import processes as proc_mod
@@ -326,6 +371,12 @@ class Reporter:
                 if outcome.get("ok"):
                     return {"id": cmd_id, "ok": True, "result": outcome}
                 return _cmd_err(cmd_id, 409, str(outcome.get("reason")))
+
+            if action == "update":
+                outcome = updater.perform(cmd_id)
+                if outcome.get("ok") and outcome.pop("restart", False):
+                    self._restart_after_post = True
+                return outcome
 
             return _cmd_err(cmd_id, 400, f"unknown action {action!r}")
         except Exception as exc:  # noqa: BLE001 -- a bad command must not kill the agent
@@ -397,6 +448,8 @@ async def run_agent(cfg: dict) -> int:
 
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
+    reporter.loop = loop
+    reporter.stopping = stopping
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stopping.set)
