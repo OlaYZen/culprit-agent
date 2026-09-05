@@ -32,7 +32,7 @@ from typing import Any, Iterable, Sequence
 
 log = logging.getLogger("culprit.db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # The host machine's own data is node 'local'; agent nodes use their enrolled
 # name. Kept as a plain column (not a separate DB per node) so cross-node
@@ -212,12 +212,16 @@ CREATE TABLE IF NOT EXISTS users (
 -- plaintext token is shown exactly once, at enrollment, and cannot be
 -- recovered from here.
 CREATE TABLE IF NOT EXISTS agents (
-    name        TEXT PRIMARY KEY,
-    token_hash  TEXT NOT NULL,
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    created_at  REAL NOT NULL,
-    last_seen   REAL,
-    last_addr   TEXT
+    name             TEXT PRIMARY KEY,
+    token_hash       TEXT NOT NULL,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    created_at       REAL NOT NULL,
+    last_seen        REAL,
+    last_addr        TEXT,
+    -- YYYY-MM-DD (host-local), the last day the scheduler sent this node an
+    -- "update" command -- persisted so a host restart doesn't forget and
+    -- fire twice in one day. NULL until the first scheduled update.
+    last_auto_update TEXT
 );
 """
 
@@ -1016,8 +1020,18 @@ class History:
 
     def list_agents(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._query(
-            "SELECT name, enabled, created_at, last_seen, last_addr "
-            "FROM agents ORDER BY name")]
+            "SELECT name, enabled, created_at, last_seen, last_addr, "
+            "last_auto_update FROM agents ORDER BY name")]
+
+    def mark_auto_updated(self, name: str, today: str) -> bool:
+        """Atomically claim today's auto-update slot for this node. Returns
+        whether it actually changed a row -- False means either the node
+        does not exist or it was already updated today, so the caller must
+        not fire the command either way."""
+        return self._execute(
+            "UPDATE agents SET last_auto_update = ? WHERE name = ? "
+            "AND (last_auto_update IS NULL OR last_auto_update != ?)",
+            (today, name, today)) > 0
 
     def verify_agent_token(self, token: str) -> str | None:
         """'<name>.<secret>' -> the agent name, or None. Constant-time hash
@@ -1087,7 +1101,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     log.info("migrating history database v%s -> v%s", version, SCHEMA_VERSION)
     if version >= 2:
         # v2 -> v3 -> v4 only add tables; CREATE IF NOT EXISTS is the whole job.
+        # v5 also adds a column to the existing agents table, which needs an
+        # explicit ALTER (CREATE TABLE IF NOT EXISTS is a no-op there).
         conn.executescript(_SCHEMA)
+        try:
+            conn.execute("ALTER TABLE agents ADD COLUMN last_auto_update TEXT")
+        except sqlite3.Error:
+            pass  # column already there (partial earlier migration)
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
                      "('schema_version', ?)", (str(SCHEMA_VERSION),))
         conn.commit()
