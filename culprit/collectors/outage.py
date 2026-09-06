@@ -41,6 +41,7 @@ import time
 from typing import Any
 
 from .. import linux
+from . import units as units_mod
 
 log = logging.getLogger("culprit.outage")
 
@@ -170,13 +171,18 @@ class OutageCollector:
             detail = problem.get("detail") or "Unit failed."
             if line.get("message"):
                 detail += f" {root_name or name}'s journal: \"{line['message']}\""
+            manager = str(problem.get("scope") or "system")
             out.append({
                 "key": f"unit_failed:{name}", "kind": "unit", "severity": "critical",
-                "title": title, "detail": detail, "unit": name,
+                "title": title, "detail": detail, "unit": name, "manager": manager,
                 "root": {"unit": root_name or name, "result": root.get("result") or problem.get("result"),
                          "line": line or None, "chain": root.get("chain") or []},
                 "fix": f"journalctl -u {root_name or name} -e; then systemctl restart {root_name or name}"
                        + (f" && systemctl restart {name}" if root_name and root_name != name else ""),
+                # The verbs the dashboard may offer for this item, decided
+                # here (guards included) so the host renders data, never
+                # invents a command for a unit it cannot see.
+                "actions": units_mod.offered("unit_failed", name, root_name, manager),
                 "evidence": {"result": problem.get("result"), "restarts": problem.get("restarts"),
                              "scope": problem.get("scope")},
             })
@@ -187,23 +193,28 @@ class OutageCollector:
                 cached = {"at": now, "line": _last_error_line(name, str(problem.get("scope") or "system"))}
                 self._loop_lines[name] = cached
             line = cached.get("line") or {}
+            manager = str(problem.get("scope") or "system")
             out.append({
                 "key": f"unit_looping:{name}", "kind": "unit", "severity": "warn",
                 "title": f"{name} is crash-looping ({problem.get('restarts')} restarts)",
                 "detail": (problem.get("detail") or "")
                           + (f" Last error: \"{line['message']}\"" if line.get("message") else ""),
-                "unit": name, "root": {"unit": name, "result": problem.get("result"), "line": line or None, "chain": []},
+                "unit": name, "manager": manager,
+                "root": {"unit": name, "result": problem.get("result"), "line": line or None, "chain": []},
                 "fix": f"journalctl -u {name} -e (the crash output); fix the cause, then systemctl restart {name}",
+                "actions": units_mod.offered("unit_looping", name, None, manager),
                 "evidence": {"restarts": problem.get("restarts"), "result": problem.get("result")},
             })
         for problem in stopped:
             name = str(problem["name"])
+            manager = str(problem.get("scope") or "system")
             out.append({
                 "key": f"unit_stopped:{name}", "kind": "unit", "severity": "warn",
                 "title": f"{name} is enabled but not running",
-                "detail": problem.get("detail") or "", "unit": name,
+                "detail": problem.get("detail") or "", "unit": name, "manager": manager,
                 "root": {"unit": name, "result": problem.get("result"), "line": None, "chain": []},
                 "fix": f"systemctl start {name}; if it stops again, journalctl -u {name} -e says why",
+                "actions": units_mod.offered("unit_stopped", name, None, manager),
                 "evidence": {"result": problem.get("result")},
             })
         checks["units"] = {"available": True, "failed": len(failed), "looping": len(looping),
@@ -218,6 +229,8 @@ class OutageCollector:
             return out
         running = {str(s.get("name")) for s in (services.get("services") or [])
                    if isinstance(s, dict) and s.get("status") == "running"}
+        scopes = {str(s.get("name")): str(s.get("scope") or "system")
+                  for s in (services.get("services") or []) if isinstance(s, dict)}
         current: set[tuple[str, int]] = set()
         for port in ports.get("ports") or []:
             if not isinstance(port, dict) or "tcp" not in (port.get("protocols") or []):
@@ -248,9 +261,10 @@ class OutageCollector:
                               "connection refused while systemd still reports the service as running: a "
                               "worker that died inside the unit, a bind that failed on reload, or a listener "
                               "moved to another address.",
-                    "unit": unit, "port": port,
+                    "unit": unit, "port": port, "manager": scopes.get(unit, "system"),
                     "root": {"unit": unit, "result": None, "line": None, "chain": []},
                     "fix": f"journalctl -u {unit} -e; ss -ltnp | grep :{port}; systemctl reload-or-restart {unit}",
+                    "actions": units_mod.offered("not_listening", unit, None, scopes.get(unit, "system")),
                     "evidence": {"port": port, "missing_samples": ticks},
                 })
         checks["listeners"] = {"available": True, "tracked": len(self._held), "missing": len(out)}

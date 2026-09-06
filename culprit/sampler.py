@@ -39,6 +39,7 @@ from .collectors import services as svc_mod
 from .collectors import ceilings as ceilings_mod
 from .collectors import cgroups as cgroups_mod
 from .collectors import kernel as kernel_mod
+from .collectors import memtrend as memtrend_mod
 from .collectors import outage as outage_mod
 from .collectors.changes import ChangeLog
 from .collectors.recorder import FlightRecorder
@@ -116,6 +117,9 @@ class Sampler:
         self.ceilings: ceilings_mod.CeilingCollector | None = None
         self.outage: outage_mod.OutageCollector | None = None
         self.changes: ChangeLog | None = None
+        # The memory-fill forecast: MemAvailable and every process's RSS over
+        # the last hour, fitted on the proc tick for the Lag Doctor.
+        self.memtrend: memtrend_mod.MemoryTrend | None = None
 
         # Rollup accumulation.
         self._bucket_ts: int | None = None
@@ -314,12 +318,20 @@ class Sampler:
             self.changes.observe_processes(processes)
             self.changes.observe_cgroups(cgroups)
 
+        if self.memtrend is None:
+            self.memtrend = memtrend_mod.MemoryTrend()
+        now = time.time()
+        self.memtrend.observe(now, snapshot.get("memory"), processes)
+        memory_forecast = self.memtrend.forecast(
+            now, total_ram=(snapshot.get("memory") or {}).get("total"))
+
         volumes = (self.store.get("volumes") or {}).get("volumes") or []
         diagnosis = self.lag.diagnose(snapshot, processes, pressures, cfg,
                                       volumes=volumes, cgroups=cgroups,
                                       kernel=kernel, changes=self.changes,
                                       ceilings=self.store.get("ceilings"),
-                                      ports=self.store.get("ports"))
+                                      ports=self.store.get("ports"),
+                                      memory_forecast=memory_forecast)
 
         # Annotate unit main processes with the units they belong to.
         service_map = (self.store.get("services") or {}).get("by_pid") or {}

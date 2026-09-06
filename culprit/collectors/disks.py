@@ -159,6 +159,9 @@ class VolumeCollector:
         self._media: list[dict[str, object]] | None = None
         # mountpoint -> (epoch, used bytes) ring for the fill forecast.
         self._history: dict[str, deque[tuple[float, int]]] = {}
+        # (pid, fd, path) -> (epoch, file offset) from the previous tick, so
+        # each open file's write rate is the offset it advanced per second.
+        self._offsets: dict[tuple[int, str, str], tuple[float, int]] = {}
         self._started = time.time()
 
     def sample(self, processes: list[dict] | None = None) -> dict[str, object]:
@@ -232,13 +235,15 @@ class VolumeCollector:
             volume["forecast"] = _forecast(ring, int(volume["free"]),
                                            int(volume["total"]), now)
 
-        writers, held, gated = _writers(
+        writers, held, gated, files = _writers(
             volumes, processes or [],
-            every_mount=[str(m["mountpoint"]) for m in all_mounts])
+            every_mount=[str(m["mountpoint"]) for m in all_mounts],
+            offsets=self._offsets, now=now)
         for volume in volumes:
             mount = str(volume["mountpoint"])
             volume["writers"] = writers.get(mount, [])
             volume["held_deleted"] = held.get(mount, [])
+            volume["files"] = files.get(mount, [])
 
         if self._media is None:
             self._media = _block_media()
@@ -253,6 +258,10 @@ class VolumeCollector:
                 "their open files are not readable at this privilege level "
                 "(CAP_SYS_PTRACE or root for other users' descriptors)."
                 if gated else None),
+            # How a file's rate is measured, stated once so the UI can say it.
+            "files_method": ("the offset of each writable descriptor, read from "
+                             "/proc/<pid>/fdinfo between samples: sequential "
+                             "writes exactly, mmap and pwrite not at all"),
         }
 
 
@@ -310,19 +319,63 @@ def _forecast(ring: deque[tuple[float, int]], free: int, total: int,
 # --------------------------------------------------------------------- writers
 _WRITERS_PER_MOUNT = 5
 _HELD_PER_MOUNT = 5
+_FILES_PER_MOUNT = 5
+_PATHS_PER_WRITER = 3
+# A process with thousands of descriptors (a database, a proxy) gets its
+# first N looked at; the rest are not worth the syscalls on a slow tick.
+_FDINFO_PER_PROCESS = 512
+_O_ACCMODE, _O_WRONLY, _O_RDWR, _O_APPEND = 0o3, 0o1, 0o2, 0o2000
+
+
+def _fd_offset(pid: int, fd: str) -> tuple[int, str] | None:
+    """(offset, mode) of one descriptor from /proc/<pid>/fdinfo/<fd>, where
+    mode is "w" / "rw" / "r" from the open flags. None when unreadable."""
+    info = linux.read_text(f"/proc/{pid}/fdinfo/{fd}")
+    if not info:
+        return None
+    pos = flags = None
+    for line in info.split("\n"):
+        if line.startswith("pos:"):
+            pos = line[4:].strip()
+        elif line.startswith("flags:"):
+            flags = line[6:].strip()
+        if pos is not None and flags is not None:
+            break
+    if pos is None or flags is None:
+        return None
+    try:
+        offset = int(pos)
+        access = int(flags, 8) & _O_ACCMODE
+    except ValueError:
+        return None
+    mode = "w" if access == _O_WRONLY else "rw" if access == _O_RDWR else "r"
+    return offset, mode
 
 
 def _writers(volumes: list[dict], processes: list[dict],
-             every_mount: list[str] | None = None
-             ) -> tuple[dict[str, list[dict]], dict[str, list[dict]], int]:
-    """Which processes are writing to which mount, and which deleted files
-    are still held open (the space a rotated log keeps until its holder
-    closes it). Both come from readlink over /proc/<pid>/fd, which is
-    readable for the caller's own processes only unless it has
-    CAP_SYS_PTRACE; the gated count keeps the answer honest."""
+             every_mount: list[str] | None = None,
+             offsets: dict[tuple[int, str, str], tuple[float, int]] | None = None,
+             now: float | None = None,
+             ) -> tuple[dict[str, list[dict]], dict[str, list[dict]], int,
+                        dict[str, list[dict]]]:
+    """Which processes are writing to which mount, which *files* they are
+    writing (and how fast), and which deleted files are still held open
+    (the space a rotated log keeps until its holder closes it).
+
+    All of it comes from /proc/<pid>/fd: readlink names the file, and the
+    descriptor's offset in fdinfo, diffed against the previous tick, is the
+    bytes it advanced per second. That is exact for a sequential writer (a
+    log, a backup, a download) and blind to mmap and pwrite, which move no
+    offset -- so a file with no rate is listed without one, never as 0. The
+    directory is readable for the caller's own processes only unless it has
+    CAP_SYS_PTRACE; the gated count keeps the answer honest. `offsets` is the
+    caller's memory between ticks; without it no rates are computed.
+    """
     reported = {str(v["mountpoint"]) for v in volumes}
     if not reported:
-        return {}, {}, 0
+        return {}, {}, 0, {}
+    now = time.time() if now is None else now
+    seen_keys: set[tuple[int, str, str]] = set()
     # Longest-prefix match over *every* mount (devtmpfs, proc, tmpfs too),
     # so /dev/null or a tmpfs file is never charged to the root volume
     # merely because "/" is a prefix of everything.
@@ -336,6 +389,7 @@ def _writers(volumes: list[dict], processes: list[dict],
 
     writers: dict[str, list[dict]] = {}
     held: dict[str, list[dict]] = {}
+    files: dict[str, list[dict]] = {}
     gated = 0
     seen_deleted: set[tuple[int, str]] = set()
     for proc in processes:
@@ -353,14 +407,17 @@ def _writers(volumes: list[dict], processes: list[dict],
             if rate > 0:
                 gated += 1
             continue
-        paths: dict[str, list[tuple[str, bool]]] = {}
+        # mount -> path -> {deleted, rate, mode}; one entry per path even
+        # when several descriptors point at it (dup'd stdout/stderr).
+        paths: dict[str, dict[str, dict]] = {}
+        looked = 0
         for fd in fds:
             try:
                 target = os.readlink(f"{fd_dir}/{fd}")
             except OSError:
                 continue
-            if not target.startswith("/"):
-                continue                # sockets, pipes, anon inodes
+            if not target.startswith("/") or target.startswith("/memfd:"):
+                continue                # sockets, pipes, anon inodes, memfds
             deleted = target.endswith(" (deleted)")
             if deleted:
                 target = target[:-len(" (deleted)")]
@@ -369,24 +426,46 @@ def _writers(volumes: list[dict], processes: list[dict],
                 continue
             if deleted:
                 key = (pid, target)
-                if key in seen_deleted:
-                    continue
-                seen_deleted.add(key)
-                try:
-                    size = os.stat(f"{fd_dir}/{fd}").st_size
-                except OSError:
-                    size = None
-                if size and size >= 1024 ** 2:
-                    held.setdefault(mount, []).append({
-                        "pid": pid, "name": proc.get("name"),
-                        "username": proc.get("username"), "unit": proc.get("unit"),
-                        "container": proc.get("container"),
-                        "path": target, "size": size,
-                    })
-            if rate > 0:
-                entry = paths.setdefault(mount, [])
-                if len(entry) < 3 and not any(p == target for p, _ in entry):
-                    entry.append((target, deleted))
+                if key not in seen_deleted:
+                    seen_deleted.add(key)
+                    try:
+                        size = os.stat(f"{fd_dir}/{fd}").st_size
+                    except OSError:
+                        size = None
+                    if size and size >= 1024 ** 2:
+                        held.setdefault(mount, []).append({
+                            "pid": pid, "name": proc.get("name"),
+                            "username": proc.get("username"), "unit": proc.get("unit"),
+                            "container": proc.get("container"),
+                            "path": target, "size": size, "fd": int(fd),
+                        })
+            if rate <= 0:
+                continue
+            entry = paths.setdefault(mount, {}).get(target)
+            if entry is None:
+                entry = paths[mount][target] = {"deleted": deleted, "rate": None, "mode": None}
+            if offsets is None or looked >= _FDINFO_PER_PROCESS:
+                continue
+            looked += 1
+            read = _fd_offset(pid, fd)
+            if read is None:
+                continue
+            offset, mode = read
+            if mode == "r":
+                continue                # a reader: no write rate to claim
+            okey = (pid, fd, target)
+            seen_keys.add(okey)
+            previous = offsets.get(okey)
+            offsets[okey] = (now, offset)
+            if entry["mode"] is None or mode == "w":
+                entry["mode"] = mode
+            if previous is None:
+                continue                # first sight: a rate needs two points
+            then, before = previous
+            if offset < before or now - then <= 0:
+                continue                # rewound (truncate / seek): not a write
+            advanced = (offset - before) / (now - then)
+            entry["rate"] = max(float(entry["rate"] or 0.0), advanced)
         if rate > 0:
             cwd_mount = None
             try:
@@ -395,23 +474,48 @@ def _writers(volumes: list[dict], processes: list[dict],
                 pass
             targets = set(paths) | ({cwd_mount} if cwd_mount and not paths else set())
             for mount in targets:
+                ranked = sorted(paths.get(mount, {}).items(),
+                                key=lambda kv: -float(kv[1]["rate"] or 0.0))
                 writers.setdefault(mount, []).append({
                     "pid": pid, "name": proc.get("name"),
                     "username": proc.get("username"), "unit": proc.get("unit"),
                     "container": proc.get("container"),
                     "write_bytes_sec": rate,
-                    "paths": [{"path": p, "deleted": d} for p, d in paths.get(mount, [])],
+                    "paths": [{"path": p, "deleted": e["deleted"],
+                               # The offset this file advanced per second;
+                               # None on first sight or for mmap/pwrite IO.
+                               "rate_bytes_sec": (round(e["rate"], 1)
+                                                  if e["rate"] is not None else None),
+                               "mode": e["mode"]}
+                              for p, e in ranked[:_PATHS_PER_WRITER]],
                     # True when only the working directory pointed here (no
                     # open file did): a weaker attribution, said as such.
                     "by_cwd": mount not in paths,
                 })
+                for path, entry in ranked:
+                    if entry["rate"]:
+                        files.setdefault(mount, []).append({
+                            "path": path, "deleted": entry["deleted"],
+                            "rate_bytes_sec": round(entry["rate"], 1),
+                            "mode": entry["mode"], "pid": pid,
+                            "name": proc.get("name"), "unit": proc.get("unit"),
+                            "container": proc.get("container"),
+                        })
+    if offsets is not None:
+        # Forget descriptors that were not seen this tick (closed, or the
+        # process stopped writing), so the map never outgrows the fd table.
+        for key in [k for k in offsets if k not in seen_keys]:
+            del offsets[key]
     for mount, entries in writers.items():
         entries.sort(key=lambda e: -float(e["write_bytes_sec"]))
         del entries[_WRITERS_PER_MOUNT:]
     for mount, entries in held.items():
         entries.sort(key=lambda e: -int(e["size"] or 0))
         del entries[_HELD_PER_MOUNT:]
-    return writers, held, gated
+    for mount, entries in files.items():
+        entries.sort(key=lambda e: -float(e["rate_bytes_sec"]))
+        del entries[_FILES_PER_MOUNT:]
+    return writers, held, gated, files
 
 
 # --------------------------------------------------------------------- helpers

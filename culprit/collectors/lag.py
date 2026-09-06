@@ -50,6 +50,12 @@ _FAULT_REFERENCE_FLOOR = 5_000.0           # page faults/sec
 _RUN_DELAY_REFERENCE = 250.0
 
 
+# The memory forecast fires within this many hours of exhaustion. Shorter than
+# the disk forecast's 24 h: memory moves faster, and an hour-long fit
+# extrapolated a day ahead would be a guess dressed as a number.
+_MEMORY_FORECAST_HORIZON_H = 4.0
+
+
 class LagAnalyzer:
     def __init__(self) -> None:
         self._sustain = Sustain()
@@ -229,12 +235,14 @@ class LagAnalyzer:
                  cgroups: dict | None = None, kernel: dict | None = None,
                  changes: object = None,
                  ceilings: dict | None = None,
-                 ports: dict | None = None) -> dict[str, object]:
+                 ports: dict | None = None,
+                 memory_forecast: dict | None = None) -> dict[str, object]:
         """Build the sustained-pressure findings and attribute them to processes.
 
         `cgroups` (per-unit pressure and limits), `kernel` (mdstat, per-core
         interrupts), `changes` (a ChangeLog), `ceilings` and `ports` (the port
-        map with its accept queues) are optional: without them the
+        map with its accept queues) and `memory_forecast` (memtrend's fit of
+        MemAvailable and per-process RSS) are optional: without them the
         machine-level findings are exactly what they were.
         """
         cpu = snapshot.get("cpu") or {}
@@ -418,6 +426,65 @@ class LagAnalyzer:
                 blame="the swap device (a rotational disk), not a process",
             )
 
+        # --- Memory-fill forecast: not out yet, but will be ---------------
+        # The disk forecast's sibling: MemAvailable fitted over the last
+        # hour, and the processes whose RSS grew meanwhile named as the
+        # growers -- which is a different question from "who is largest"
+        # (memory_low ranks that) and from "whom the OOM killer takes"
+        # (the kernel's own ranking, attached below as next_victims).
+        forecast = memory_forecast if isinstance(memory_forecast, dict) else {}
+        eta = forecast.get("seconds_to_exhaust")
+        if isinstance(eta, (int, float)) and forecast.get("trend") == "shrinking":
+            hours = float(eta) / 3600
+            r2 = float(forecast.get("r2") or 0)
+            steadiness = ("steadily" if r2 >= 0.9 else "unevenly" if r2 >= 0.5 else "erratically")
+            growers = [g for g in (forecast.get("growers") or []) if isinstance(g, dict)]
+            newcomers = [n for n in (forecast.get("newcomers") or []) if isinstance(n, dict)]
+            who = ""
+            if growers:
+                top = growers[0]
+                share = top.get("share_of_loss")
+                who = (f" {top.get('name')} (pid {top.get('pid')}) grew by "
+                       f"{_mb(top.get('growth_bytes'))} over the same window"
+                       + (f", {float(share) * 100:.0f}% of what the machine lost"
+                          if isinstance(share, (int, float)) else "") + ".")
+            elif newcomers:
+                top = newcomers[0]
+                who = (f" No process grew steadily enough to name, but {top.get('name')} "
+                       f"(pid {top.get('pid')}) appeared {_minutes_text(float(top.get('elapsed_seconds') or 0) / 60)} "
+                       f"ago holding {_mb(top.get('working_set'))}.")
+            else:
+                who = " No single process accounts for it: the growth is spread, or in the kernel (slab, page tables)."
+            victim = None
+            if isinstance(ceilings, dict):
+                nxt = ((ceilings.get("oom") or {}).get("next") or [])
+                victim = nxt[0] if nxt and isinstance(nxt[0], dict) else None
+            if growers and victim and victim.get("pid") != growers[0].get("pid"):
+                who += (f" That is not what the OOM killer would take first -- its own "
+                        f"ranking says {victim.get('name')} (pid {victim.get('pid')}).")
+            consider(
+                "memory_forecast", hours <= _MEMORY_FORECAST_HORIZON_H,
+                "critical" if hours <= 0.5 else "warn" if hours <= 2 else "info",
+                f"Available memory runs out in about {_hours_text(hours)}",
+                f"MemAvailable has fallen {steadiness} by {_mb(-float(forecast.get('delta_bytes') or 0))} "
+                f"over the last {float(forecast.get('window_seconds') or 0) / 60:.0f} min "
+                f"({_mb(-float(forecast.get('bytes_per_hour') or 0))}/h); {_mb(forecast.get('available_bytes'))} "
+                f"is left. At this rate it is gone in about {_hours_text(hours)}"
+                + (" -- an extrapolation of an uneven trend, so treat the time as rough"
+                   if r2 < 0.9 else "")
+                + ", and the kernel starts reclaiming, swapping, then killing." + who,
+                "memory", {"available_bytes": forecast.get("available_bytes"),
+                           "rate_bytes_hour": forecast.get("bytes_per_hour"),
+                           "hours_to_exhaust": round(hours, 1), "r2": r2},
+            )
+            for candidate in reversed(candidates):
+                if candidate.get("key") == "memory_forecast":
+                    candidate["growers"] = growers
+                    candidate["newcomers"] = newcomers
+                    break
+        else:
+            consider("memory_forecast", False, "info", "", "", "memory", {})
+
         # --- Inside one unit: what the machine-wide numbers hide -----------
         unit_oom = self._unit_findings(cgroups, consider, candidates, cfg, now,
                                        psi_cpu, psi_mem_full, psi_io_full)
@@ -532,6 +599,9 @@ class LagAnalyzer:
                                  "held_by_deleted": held_bytes or None},
                     "sustained_ticks": cfg.sustain_ticks,
                     "writers": writers, "mount": mount,
+                    # The deleted-but-open files themselves, so the card can
+                    # offer to free them (truncate through the holder's fd).
+                    "held": held[:3],
                 })
             # Fill forecast: not full yet, but will be. The rate is a
             # least-squares slope over the last hour; erratic growth (a
@@ -569,6 +639,7 @@ class LagAnalyzer:
                     if candidate.get("key") == key:
                         candidate["writers"] = writers
                         candidate["mount"] = mount
+                        candidate["held"] = held[:3]
                         break
             else:
                 consider(key, False, "info", "", "", "storage", {})
@@ -629,9 +700,24 @@ class LagAnalyzer:
                     {**_culprit_of(w, "storage"),
                      "share": (f"{_mb(w.get('write_bytes_sec'))}/s"
                                + (" (by working directory)" if w.get("by_cwd") else "")),
-                     "paths": w.get("paths") or []}
+                     "paths": w.get("paths") or [],
+                     # The file it is writing fastest, with the rate its
+                     # descriptor advanced -- the name, not just the process.
+                     "file": _fastest_path(w.get("paths") or [])}
                     for w in (finding.pop("writers", None) or [])
                     if isinstance(w, dict) and w.get("pid") is not None
+                ]
+            elif finding.get("growers") is not None:
+                # The memory forecast ranks the processes that *grew*, by
+                # their growth rate, not the largest ones: a leak is a
+                # slope. Nothing grew -> no culprits, and the detail says
+                # where else to look.
+                by_pid = {p.get("pid"): p for p in processes}
+                finding["culprits"] = [
+                    {**_culprit_of(by_pid.get(g.get("pid")) or _row_from_grower(g), "memory"),
+                     "share": _growth_text(g), "growth_bytes": g.get("growth_bytes"),
+                     "rate_bytes_sec": g.get("rate_bytes_sec")}
+                    for g in finding["growers"] if isinstance(g, dict)
                 ]
             elif "listeners" in finding:
                 # A turned-away finding names the process(es) holding the
@@ -692,6 +778,10 @@ class LagAnalyzer:
             "pressures": pressures,
             "pressure_mode": pressures.get("mode", "derived"),
             "offenders": [_slim(p) for p in ranked[:12] if float(p.get("lag_score") or 0) > 1],
+            # Where MemAvailable is heading (memtrend): rendered under the
+            # memory gauge whether or not it has become a finding.
+            "memory_forecast": (memory_forecast if isinstance(memory_forecast, dict)
+                                else {"available": False, "reason": "not computed"}),
         }
 
 
@@ -1415,6 +1505,38 @@ def _headline(severity: str, findings: list[dict]) -> str:
         inside = f" in {where['name']}" if where.get("name") else ""
         return f"{top['title']} - {lead['name']}{inside} ({lead['share']}) leads."
     return str(top["title"])
+
+
+def _fastest_path(paths: list) -> dict[str, object] | None:
+    best = None
+    for entry in paths:
+        if not isinstance(entry, dict):
+            continue
+        rate = entry.get("rate_bytes_sec")
+        if isinstance(rate, (int, float)) and rate > 0 and \
+                (best is None or rate > float(best.get("rate_bytes_sec") or 0)):
+            best = entry
+    if best is None:
+        return None
+    return {"path": best.get("path"), "rate_bytes_sec": best.get("rate_bytes_sec"),
+            "deleted": bool(best.get("deleted"))}
+
+
+def _row_from_grower(grower: dict) -> dict:
+    """A process row for a grower that has just left the table (exited
+    between the fit and this tick): what memtrend remembered of it."""
+    return {"pid": grower.get("pid"), "name": grower.get("name"),
+            "username": grower.get("username"), "working_set": grower.get("working_set"),
+            "container": grower.get("container"), "unit": grower.get("unit")}
+
+
+def _growth_text(grower: dict) -> str:
+    text = (f"+{_mb(grower.get('growth_bytes'))} in "
+            f"{_minutes_text(float(grower.get('window_seconds') or 0) / 60)}")
+    share = grower.get("share_of_loss")
+    if isinstance(share, (int, float)):
+        text += f" ({float(share) * 100:.0f}% of the loss)"
+    return text
 
 
 def _mb(value: object) -> str:

@@ -32,6 +32,7 @@ import logging
 import os
 import pwd
 import signal
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
@@ -820,6 +821,82 @@ def throttle(pid: int, level: str) -> dict[str, object]:
         "process_count": after.get("process_count"),
         "runtime_only": True,   # --runtime: cleared by a reboot or daemon-reload
         "note": note,
+    }
+
+
+# Freeing the space a deleted-but-open file still holds. A rotated log the
+# daemon never closed keeps its blocks until the last descriptor goes, and
+# `df` keeps counting them; the classic fix is `: > /proc/<pid>/fd/<n>`,
+# which truncates the inode through the holder's own descriptor without
+# touching the process. This does exactly that, and nothing else: the file
+# must still be deleted (link count 0), regular, and the one the caller
+# named -- a live file with a name is never truncated from here.
+def truncate_deleted(pid: int, path: str) -> dict[str, object]:
+    if not isinstance(path, str) or not path.startswith("/") or len(path) > 4096:
+        return {"ok": False, "reason": "path must be the absolute path the holder shows"}
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        fds = os.listdir(fd_dir)
+    except FileNotFoundError:
+        return {"ok": False, "reason": "process no longer exists"}
+    except PermissionError:
+        return {"ok": False,
+                "reason": ("Permission denied: another user's descriptors are not "
+                           "readable; freeing this needs root (or CAP_SYS_PTRACE "
+                           "and write access to the file).")}
+    except OSError as exc:
+        return {"ok": False, "reason": str(exc)}
+    wanted = f"{path} (deleted)"
+    fd_path = None
+    live = False
+    for fd in fds:
+        try:
+            target = os.readlink(f"{fd_dir}/{fd}")
+        except OSError:
+            continue
+        if target == wanted:
+            fd_path = f"{fd_dir}/{fd}"
+            break
+        if target == path:
+            live = True
+    if fd_path is None:
+        if live:
+            return {"ok": False,
+                    "reason": (f"{path} still has a name on disk -- it is open, not "
+                               "merely held; only deleted files are truncated from here")}
+        return {"ok": False,
+                "reason": ("that process no longer holds a deleted file at this "
+                           "path -- it closed it, or the file has a name again")}
+    try:
+        before = os.stat(fd_path)
+    except OSError as exc:
+        return {"ok": False, "reason": f"could not stat the descriptor: {exc}"}
+    if not stat.S_ISREG(before.st_mode):
+        return {"ok": False, "reason": "not a regular file; only files are truncated"}
+    if before.st_nlink != 0:
+        return {"ok": False,
+                "reason": ("the file still has a name on disk (link count "
+                           f"{before.st_nlink}), so it is not merely held -- "
+                           "refusing to truncate a live file")}
+    try:
+        os.truncate(fd_path, 0)
+        after = os.stat(fd_path).st_size
+    except PermissionError:
+        return {"ok": False,
+                "reason": ("Permission denied: truncating needs write access to "
+                           "the file (its owner, or root).")}
+    except OSError as exc:
+        return {"ok": False, "reason": str(exc)}
+    try:
+        name = psutil.Process(pid).name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        name = None
+    return {
+        "ok": True, "pid": pid, "name": name, "path": path,
+        "freed_bytes": max(0, before.st_size - after), "size_after": after,
+        "note": ("The holder still has the descriptor open: if it keeps appending, "
+                 "the file grows again from zero. Restarting it (or a log rotation "
+                 "it honours) closes the handle for good."),
     }
 
 
