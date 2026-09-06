@@ -32,7 +32,9 @@ from typing import Any, Iterable, Sequence
 
 log = logging.getLogger("culprit.db")
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+ROLES = ("viewer", "operator", "admin")
 
 # The host machine's own data is node 'local'; agent nodes use their enrolled
 # name. Kept as a plain column (not a separate DB per node) so cross-node
@@ -205,7 +207,8 @@ CREATE INDEX IF NOT EXISTS idx_deaths_ts ON deaths(died_at);
 CREATE TABLE IF NOT EXISTS users (
     username      TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,     -- scrypt$<salt-hex>$<hash-hex>
-    created_at    REAL NOT NULL
+    created_at    REAL NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'admin'   -- viewer | operator | admin
 );
 
 -- Enrolled agent nodes. Only the SHA-256 of each token is stored -- the
@@ -920,17 +923,52 @@ class History:
                 self._query("SELECT DISTINCT node FROM samples ORDER BY node")]
 
     # ------------------------------------------------------------ users / auth
-    def add_user(self, username: str, password: str) -> None:
+    def add_user(self, username: str, password: str, role: str = "admin") -> None:
+        if role not in ROLES:
+            raise ValueError(f"unknown role: {role!r}")
+        # On conflict (an existing username) only the password is refreshed --
+        # this doubles as the "reset a forgotten password" flow, and a role is
+        # a separate, deliberate decision (set_role / `users role`), never a
+        # side effect of a password reset that might not even mention one.
         self._execute(
-            "INSERT INTO users (username, password_hash, created_at) "
-            "VALUES (?, ?, ?) "
+            "INSERT INTO users (username, password_hash, created_at, role) "
+            "VALUES (?, ?, ?, ?) "
             "ON CONFLICT(username) DO UPDATE SET password_hash=excluded.password_hash",
-            (username, hash_password(password), time.time()),
+            (username, hash_password(password), time.time(), role),
         )
 
+    def count_admins(self) -> int:
+        rows = self._query(
+            "SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
+        return int(rows[0]["n"]) if rows else 0
+
     def remove_user(self, username: str) -> bool:
+        """False if no such user, or if removing it would leave zero admins."""
+        row = self._query("SELECT role FROM users WHERE username = ?", (username,))
+        if not row:
+            return False
+        if row[0]["role"] == "admin" and self.count_admins() <= 1:
+            return False
         return self._execute("DELETE FROM users WHERE username = ?",
                              (username,)) > 0
+
+    def set_role(self, username: str, role: str) -> bool:
+        """False if no such user, an unknown role, or the change would leave
+        zero admins."""
+        if role not in ROLES:
+            return False
+        row = self._query("SELECT role FROM users WHERE username = ?", (username,))
+        if not row:
+            return False
+        if row[0]["role"] == "admin" and role != "admin" and self.count_admins() <= 1:
+            return False
+        return self._execute("UPDATE users SET role = ? WHERE username = ?",
+                             (role, username)) > 0
+
+    def user_role(self, username: str) -> str | None:
+        rows = self._query("SELECT role FROM users WHERE username = ?",
+                           (username,))
+        return rows[0]["role"] if rows else None
 
     def set_password(self, username: str, password: str) -> bool:
         """Change an existing user's password. False if no such user."""
@@ -951,7 +989,7 @@ class History:
 
     def list_users(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._query(
-            "SELECT username, created_at FROM users ORDER BY username")]
+            "SELECT username, created_at, role FROM users ORDER BY username")]
 
     def verify_user(self, username: str, password: str) -> bool:
         rows = self._query("SELECT password_hash FROM users WHERE username = ?",
@@ -972,6 +1010,16 @@ class History:
         rows = self._query("SELECT password_hash FROM users WHERE username = ?",
                            (username,))
         return rows[0]["password_hash"] if rows else None
+
+    def user_credentials(self, username: str) -> tuple[str, str] | None:
+        """(password_hash, role), one query -- what auth.py caches per user so
+        a role change is visible exactly as fast as a password change."""
+        rows = self._query(
+            "SELECT password_hash, role FROM users WHERE username = ?",
+            (username,))
+        if not rows:
+            return None
+        return rows[0]["password_hash"], rows[0]["role"]
 
     def user_count(self) -> int:
         rows = self._query("SELECT COUNT(*) AS n FROM users")
@@ -1101,11 +1149,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
     log.info("migrating history database v%s -> v%s", version, SCHEMA_VERSION)
     if version >= 2:
         # v2 -> v3 -> v4 only add tables; CREATE IF NOT EXISTS is the whole job.
-        # v5 also adds a column to the existing agents table, which needs an
-        # explicit ALTER (CREATE TABLE IF NOT EXISTS is a no-op there).
+        # v5 and v6 each add a column to an existing table, which needs an
+        # explicit ALTER (CREATE TABLE IF NOT EXISTS is a no-op there). Every
+        # user predating roles gets 'admin' -- the single tier they already
+        # had, not a silent downgrade.
         conn.executescript(_SCHEMA)
         try:
             conn.execute("ALTER TABLE agents ADD COLUMN last_auto_update TEXT")
+        except sqlite3.Error:
+            pass  # column already there (partial earlier migration)
+        try:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
         except sqlite3.Error:
             pass  # column already there (partial earlier migration)
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
