@@ -170,6 +170,12 @@ class VolumeCollector:
         volumes = []
         skipped = []
         seen_devices: set[str] = set()
+        # A second mount of a device already reported (a btrfs subvolume
+        # such as /home or /var/log, a bind mount) is not a second volume,
+        # but files under it still live on that volume: remember which one,
+        # so a writer under /home is charged to / and not to nothing.
+        first_mount: dict[str, str] = {}
+        aliases: dict[str, str] = {}
         now = time.time()
         all_mounts = _mounts()
         for mount in all_mounts:
@@ -187,8 +193,10 @@ class VolumeCollector:
                                           "not probed, it can hang the sampler"})
                 continue
             if source in seen_devices:
+                aliases[mountpoint] = first_mount[source]
                 continue  # bind mounts and btrfs subvolumes repeat the device
             seen_devices.add(source)
+            first_mount[source] = mountpoint
             try:
                 usage = os.statvfs(mountpoint)
             except OSError as exc:
@@ -235,10 +243,12 @@ class VolumeCollector:
             volume["forecast"] = _forecast(ring, int(volume["free"]),
                                            int(volume["total"]), now)
 
+        reported = {str(v["mountpoint"]) for v in volumes}
         writers, held, gated, files = _writers(
             volumes, processes or [],
             every_mount=[str(m["mountpoint"]) for m in all_mounts],
-            offsets=self._offsets, now=now)
+            offsets=self._offsets, now=now,
+            aliases={m: v for m, v in aliases.items() if v in reported})
         for volume in volumes:
             mount = str(volume["mountpoint"])
             volume["writers"] = writers.get(mount, [])
@@ -356,6 +366,7 @@ def _writers(volumes: list[dict], processes: list[dict],
              every_mount: list[str] | None = None,
              offsets: dict[tuple[int, str, str], tuple[float, int]] | None = None,
              now: float | None = None,
+             aliases: dict[str, str] | None = None,
              ) -> tuple[dict[str, list[dict]], dict[str, list[dict]], int,
                         dict[str, list[dict]]]:
     """Which processes are writing to which mount, which *files* they are
@@ -370,6 +381,8 @@ def _writers(volumes: list[dict], processes: list[dict],
     directory is readable for the caller's own processes only unless it has
     CAP_SYS_PTRACE; the gated count keeps the answer honest. `offsets` is the
     caller's memory between ticks; without it no rates are computed.
+    `aliases` maps a mount that is another view of a reported volume (a btrfs
+    subvolume, a bind mount) to that volume, so its files count there.
     """
     reported = {str(v["mountpoint"]) for v in volumes}
     if not reported:
@@ -379,12 +392,16 @@ def _writers(volumes: list[dict], processes: list[dict],
     # Longest-prefix match over *every* mount (devtmpfs, proc, tmpfs too),
     # so /dev/null or a tmpfs file is never charged to the root volume
     # merely because "/" is a prefix of everything.
-    mounts = sorted(set(every_mount or []) | reported, key=len, reverse=True)
+    mounts = sorted(set(every_mount or []) | reported | set(aliases or {}), key=len, reverse=True)
+
+    alias = aliases or {}
 
     def mount_of(path: str) -> str | None:
         for mount in mounts:
             if path == mount or path.startswith(mount.rstrip("/") + "/"):
-                return mount if mount in reported else None
+                if mount in reported:
+                    return mount
+                return alias.get(mount)
         return None
 
     writers: dict[str, list[dict]] = {}
