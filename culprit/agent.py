@@ -258,6 +258,10 @@ class Reporter:
                 "interval_fast": config_module.get().interval_fast,
                 "update_capable": self._update_capable,
                 "update_reason": self._update_reason,
+                # This build takes a `ref` on the update command (a version
+                # change, usually a downgrade); the host refuses to send one
+                # to an agent that has not said so.
+                "update_refs": updater.SUPPORTS_REF,
             },
             "snapshot": self._build_snapshot(),
         }
@@ -385,7 +389,8 @@ class Reporter:
                 return _cmd_err(cmd_id, 409, str(outcome.get("reason")))
 
             if action == "update":
-                outcome = updater.perform(cmd_id)
+                ref = command.get("ref")
+                outcome = updater.perform(cmd_id, str(ref) if ref else None)
                 if outcome.get("ok") and outcome.pop("restart", False):
                     self._restart_after_post = True
                 return outcome

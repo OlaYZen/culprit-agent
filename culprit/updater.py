@@ -9,14 +9,22 @@ host). This module only answers what the host cannot know from outside the
 machine, and does the update itself:
 
     capability()  can this install even be updated this way, and why not
-    perform()      actually git-pull + reinstall + ask for a restart
+    perform()      actually git-pull + reinstall + ask for a restart -- to
+                   origin/<branch> by default, or to a commit the host names
+                   (`ref`), which is how a downgrade works: the host resolves
+                   a version to the newest commit that carried it and sends
+                   that sha; this side only checks the commit is real and on
+                   the branch it tracks before resetting to it
 
 Deliberately the "quickest dirtiest way": a real git clone with a working
 `origin` remote is the whole mechanism, restarted via a clean process exit
 that leans on the systemd unit's own `Restart=always` (see agent.sh). No
 `systemctl` shell-out, no separate installer, no version-number gate on the
 apply step -- perform() always resets to whatever origin/<branch> actually
-has, regardless of what any version string claims.
+has (or to the exact commit it was given), regardless of what any version
+string claims. SUPPORTS_REF is reported to the host as `update_refs`, so a
+host never sends a ref to an agent that would silently ignore it and update
+to the tip instead.
 
 Every git call passes `-c safe.directory=<ROOT>`: a system service (`sudo
 ./agent.sh`) runs as root over a checkout some other user cloned, and git
@@ -32,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -40,6 +49,12 @@ from . import config as config_module
 log = logging.getLogger("culprit.agent.updater")
 
 _GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # never hang on a prompt
+
+# This build honours an "update" command's `ref`. Reported in every agent
+# meta so the host can refuse a version change for an older agent instead of
+# sending a ref it would ignore.
+SUPPORTS_REF = True
+_SHA = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 def _git(*args: str, timeout: float) -> tuple[bool, str]:
@@ -114,13 +129,21 @@ def _cmd_err(cmd_id, status: int, message: str) -> dict:
     return {"id": cmd_id, "ok": False, "status": status, "error": message}
 
 
-def perform(cmd_id) -> dict:
+def perform(cmd_id, ref: str | None = None) -> dict:
     """Run the update. Returns the {"id", "ok", ...} shape agent.py's other
     command results use, plus "restart": True when the caller should exit
-    once this result has been posted back. Never raises."""
+    once this result has been posted back. Never raises.
+
+    `ref` names the commit to end up on (a sha, from the host's mirror of
+    this repository); without one the target is origin/<branch>. A ref is
+    accepted only when it is a commit git knows after the fetch and lies on
+    origin/<branch>'s history -- a downgrade to an older release, never a
+    jump to some unrelated commit."""
     capable, reason = capability()
     if not capable:
         return _cmd_err(cmd_id, 409, reason or "not capable")
+    if ref is not None and not _SHA.match(str(ref)):
+        return _cmd_err(cmd_id, 400, "ref must be a commit sha")
 
     ok, out = _git("rev-parse", "HEAD", timeout=10)
     if not ok:
@@ -132,16 +155,25 @@ def perform(cmd_id) -> dict:
         return _cmd_err(cmd_id, 502, f"git fetch failed: {out}")
 
     branch = current_branch()
-    ok, out = _git("reset", "--hard", "--quiet", f"origin/{branch}", timeout=30)
+    target = f"origin/{branch}"
+    if ref is not None:
+        ok, out = _git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", timeout=10)
+        if not ok or not out.strip():
+            return _cmd_err(cmd_id, 404, f"commit {ref[:12]} is not in this checkout even after fetching")
+        target = out.strip()
+        ok, _ = _git("merge-base", "--is-ancestor", target, f"origin/{branch}", timeout=10)
+        if not ok:
+            return _cmd_err(cmd_id, 409, f"commit {ref[:12]} is not on origin/{branch}; refusing to leave the branch")
+    ok, out = _git("reset", "--hard", "--quiet", target, timeout=30)
     if not ok:
-        return _cmd_err(cmd_id, 500, f"git reset --hard origin/{branch} failed: {out}")
+        return _cmd_err(cmd_id, 500, f"git reset --hard {target[:12]} failed: {out}")
 
     ok, out = _git("rev-parse", "HEAD", timeout=10)
     to_sha = out.strip() if ok else from_sha
 
     if to_sha == from_sha:
         return {"id": cmd_id, "ok": True,
-                "result": {"updated": False, "sha": to_sha[:12]}}
+                "result": {"updated": False, "sha": to_sha[:12], "pinned": ref is not None}}
 
     ok, out = _pip("install", "--quiet", "-r", "requirements-agent.txt", timeout=180)
     if not ok:
@@ -154,5 +186,5 @@ def perform(cmd_id) -> dict:
 
     return {"id": cmd_id, "ok": True,
             "result": {"updated": True, "from_sha": from_sha[:12],
-                      "to_sha": to_sha[:12]},
+                       "to_sha": to_sha[:12], "pinned": ref is not None},
             "restart": True}
