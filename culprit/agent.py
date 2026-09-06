@@ -194,7 +194,6 @@ class Reporter:
         # restart from the executor thread it actually runs in.
         self._update_capable: bool | None = None
         self._update_reason: str | None = None
-        self._update_branch: str | None = None
         self._last_capability_check = 0.0
         self._restart_after_post = False
         self.loop = None
@@ -247,7 +246,6 @@ class Reporter:
             return
         self._last_capability_check = now
         self._update_capable, self._update_reason = updater.capability()
-        self._update_branch = updater.current_branch() if self._update_capable else None
 
     def push(self) -> bool:
         """One report. Runs in a thread (urllib blocks)."""
@@ -265,8 +263,11 @@ class Reporter:
                 # to an agent that has not said so.
                 "update_refs": updater.SUPPORTS_REF,
                 # The branch this checkout is on, so the host can tell an
-                # agent on the wrong line from one that is merely behind.
-                "update_branch": self._update_branch,
+                # agent on the wrong line from one that is merely behind. Read
+                # from .git/HEAD on every report (a file read, not git), so a
+                # checkout done by hand is seen with the next report instead
+                # of at the next capability check minutes later.
+                "update_branch": updater.head_branch(),
             },
             "snapshot": self._build_snapshot(),
         }

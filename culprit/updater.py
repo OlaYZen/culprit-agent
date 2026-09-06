@@ -92,12 +92,37 @@ def _pip(*args: str, timeout: float) -> tuple[bool, str]:
     return True, completed.stdout
 
 
+def head_branch() -> str | None:
+    """The branch the checkout is on, read straight from .git/HEAD -- a file
+    read, no subprocess, so every report can carry it and a `git checkout`
+    done by hand shows on the host with the next report rather than at the
+    next capability check. None when there is no checkout, HEAD is detached,
+    or the file cannot be read."""
+    git_dir = config_module.ROOT / ".git"
+    try:
+        if git_dir.is_file():
+            # A worktree: ".git" is a pointer file to the real git dir.
+            pointer = git_dir.read_text(encoding="utf-8").strip()
+            if not pointer.startswith("gitdir:"):
+                return None
+            git_dir = (config_module.ROOT / pointer[len("gitdir:"):].strip()).resolve()
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if head.startswith("ref: refs/heads/"):
+        return head[len("ref: refs/heads/"):] or None
+    return None
+
+
 def current_branch() -> str:
     """The checkout's branch to reset to in perform(), or "main" when there
     is no .git to ask (a Docker or cp -r deployment, which capability()
     already refuses before this is ever called)."""
-    if not (config_module.ROOT / ".git").is_dir():
+    if not (config_module.ROOT / ".git").exists():
         return "main"
+    branch = head_branch()
+    if branch:
+        return branch
     ok, out = _git("rev-parse", "--abbrev-ref", "HEAD", timeout=10)
     return out.strip() if ok and out.strip() else "main"
 
