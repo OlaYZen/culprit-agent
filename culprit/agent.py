@@ -194,6 +194,7 @@ class Reporter:
         # restart from the executor thread it actually runs in.
         self._update_capable: bool | None = None
         self._update_reason: str | None = None
+        self._update_branch: str | None = None
         self._last_capability_check = 0.0
         self._restart_after_post = False
         self.loop = None
@@ -246,6 +247,7 @@ class Reporter:
             return
         self._last_capability_check = now
         self._update_capable, self._update_reason = updater.capability()
+        self._update_branch = updater.current_branch() if self._update_capable else None
 
     def push(self) -> bool:
         """One report. Runs in a thread (urllib blocks)."""
@@ -262,6 +264,9 @@ class Reporter:
                 # change, usually a downgrade); the host refuses to send one
                 # to an agent that has not said so.
                 "update_refs": updater.SUPPORTS_REF,
+                # The branch this checkout is on, so the host can tell an
+                # agent on the wrong line from one that is merely behind.
+                "update_branch": self._update_branch,
             },
             "snapshot": self._build_snapshot(),
         }
@@ -390,7 +395,9 @@ class Reporter:
 
             if action == "update":
                 ref = command.get("ref")
-                outcome = updater.perform(cmd_id, str(ref) if ref else None)
+                branch = command.get("branch")
+                outcome = updater.perform(cmd_id, str(ref) if ref else None,
+                                          str(branch) if branch else None)
                 if outcome.get("ok") and outcome.pop("restart", False):
                     self._restart_after_post = True
                 return outcome

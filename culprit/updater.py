@@ -129,10 +129,20 @@ def _cmd_err(cmd_id, status: int, message: str) -> dict:
     return {"id": cmd_id, "ok": False, "status": status, "error": message}
 
 
-def perform(cmd_id, ref: str | None = None) -> dict:
+_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
+
+
+def perform(cmd_id, ref: str | None = None, branch: str | None = None) -> dict:
     """Run the update. Returns the {"id", "ok", ...} shape agent.py's other
     command results use, plus "restart": True when the caller should exit
     once this result has been posted back. Never raises.
+
+    `branch` is the line the host wants this agent on (its Settings say
+    which); without one the checkout's own branch is kept. A branch other
+    than the current one is switched to with `git checkout -B` onto
+    origin/<branch>, after the fetch has shown origin actually has it. The
+    repository is never chosen by the host: origin stays whatever this
+    checkout was cloned from.
 
     `ref` names the commit to end up on (a sha, from the host's mirror of
     this repository); without one the target is origin/<branch>. A ref is
@@ -144,6 +154,8 @@ def perform(cmd_id, ref: str | None = None) -> dict:
         return _cmd_err(cmd_id, 409, reason or "not capable")
     if ref is not None and not _SHA.match(str(ref)):
         return _cmd_err(cmd_id, 400, "ref must be a commit sha")
+    if branch is not None and not _BRANCH.match(str(branch)):
+        return _cmd_err(cmd_id, 400, "branch is not a valid branch name")
 
     ok, out = _git("rev-parse", "HEAD", timeout=10)
     if not ok:
@@ -154,7 +166,18 @@ def perform(cmd_id, ref: str | None = None) -> dict:
     if not ok:
         return _cmd_err(cmd_id, 502, f"git fetch failed: {out}")
 
-    branch = current_branch()
+    was_on = current_branch()
+    branch = branch or was_on
+    ok, out = _git("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}", timeout=10)
+    if not ok or not out.strip():
+        return _cmd_err(cmd_id, 404, f"origin has no branch '{branch}'")
+    if branch != was_on:
+        # Switch lines: a local branch of that name tracking origin's, reset
+        # to it. The working tree is clean (capability() checked), so nothing
+        # is lost by the switch.
+        ok, out = _git("checkout", "--quiet", "-B", branch, f"origin/{branch}", timeout=30)
+        if not ok:
+            return _cmd_err(cmd_id, 500, f"git checkout -B {branch} origin/{branch} failed: {out}")
     target = f"origin/{branch}"
     if ref is not None:
         ok, out = _git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", timeout=10)
@@ -173,7 +196,8 @@ def perform(cmd_id, ref: str | None = None) -> dict:
 
     if to_sha == from_sha:
         return {"id": cmd_id, "ok": True,
-                "result": {"updated": False, "sha": to_sha[:12], "pinned": ref is not None}}
+                "result": {"updated": False, "sha": to_sha[:12], "pinned": ref is not None,
+                           "branch": branch}}
 
     ok, out = _pip("install", "--quiet", "-r", "requirements-agent.txt", timeout=180)
     if not ok:
@@ -186,5 +210,6 @@ def perform(cmd_id, ref: str | None = None) -> dict:
 
     return {"id": cmd_id, "ok": True,
             "result": {"updated": True, "from_sha": from_sha[:12],
-                       "to_sha": to_sha[:12], "pinned": ref is not None},
+                       "to_sha": to_sha[:12], "pinned": ref is not None,
+                       "branch": branch, "switched_from": was_on if was_on != branch else None},
             "restart": True}
