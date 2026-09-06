@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import os
 import threading
 from dataclasses import asdict, dataclass, field, fields
@@ -125,6 +126,13 @@ class Config:
     # last report says it is update_capable and update_available.
     auto_update_enabled: bool = False
     auto_update_hour: int = 3        # 0-23, host-local time
+    # The branch of the agent repository agents are moved to and measured
+    # against: the published version is read from it, Patch notes and the
+    # version picker list it, and every update command names it so an agent
+    # on another branch switches. "main" is the release line; "dev" follows
+    # unreleased work. The repository itself is never configurable here: an
+    # agent only ever pulls from its own origin remote.
+    agent_update_branch: str = "main"
 
     # --- network trust ----------------------------------------------------
     # Reverse proxies are refused until declared: a request that carries a
@@ -209,7 +217,7 @@ EDITABLE = {
     "event_lookback_days", "event_max_per_source",
     "allow_process_actions", "allow_remote_update", "open_browser", "ui",
     "deploy_host", "agent_command",
-    "auto_update_enabled", "auto_update_hour",
+    "auto_update_enabled", "auto_update_hour", "agent_update_branch",
     "trusted_proxies", "trusted_hosts",
     "notify_ntfy_url", "notify_webhook_url", "notify_smtp_host",
     "notify_smtp_port", "notify_smtp_user", "notify_smtp_password",
@@ -244,7 +252,22 @@ def _short_text(value: str) -> str:
     return value
 
 
+_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
+
+
+def _branch_name(value: str) -> str:
+    """A git branch name: what `git check-ref-format --branch` accepts,
+    minus the exotic. It is only ever interpolated into a raw GitHub URL
+    and handed to the agent, which checks origin actually has it."""
+    if not value:
+        raise ValueError("a branch name is required (main is the release line)")
+    if not _BRANCH.match(value) or ".." in value or value.endswith(("/", ".", ".lock")) or "//" in value:
+        raise ValueError("not a valid branch name")
+    return value
+
+
 TEXT_VALIDATORS: dict[str, Any] = {
+    "agent_update_branch": _branch_name,
     "notify_ntfy_url": _url_or_empty,
     "notify_webhook_url": _url_or_empty,
     "notify_min_severity": _severity,
