@@ -32,7 +32,7 @@ from typing import Any, Iterable, Sequence
 
 log = logging.getLogger("culprit.db")
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 ROLES = ("viewer", "operator", "admin")
 
@@ -224,7 +224,13 @@ CREATE TABLE IF NOT EXISTS agents (
     -- YYYY-MM-DD (host-local), the last day the scheduler sent this node an
     -- "update" command -- persisted so a host restart doesn't forget and
     -- fire twice in one day. NULL until the first scheduled update.
-    last_auto_update TEXT
+    last_auto_update TEXT,
+    -- Set when an operator moved this agent to a chosen (usually older)
+    -- version: the daily sweep and "Update all" then leave it alone until
+    -- the pin is cleared or the node is explicitly updated again. The ref
+    -- is the commit that version resolved to at the time.
+    pinned_version   TEXT,
+    pinned_ref       TEXT
 );
 """
 
@@ -1069,7 +1075,14 @@ class History:
     def list_agents(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._query(
             "SELECT name, enabled, created_at, last_seen, last_addr, "
-            "last_auto_update FROM agents ORDER BY name")]
+            "last_auto_update, pinned_version, pinned_ref FROM agents ORDER BY name")]
+
+    def set_agent_pin(self, name: str, version: str | None, ref: str | None) -> bool:
+        """Pin an agent to a version (an operator moved it there on purpose)
+        or clear the pin with (None, None). Returns whether the row exists."""
+        return self._execute(
+            "UPDATE agents SET pinned_version = ?, pinned_ref = ? WHERE name = ?",
+            (version, ref, name)) > 0
 
     def mark_auto_updated(self, name: str, today: str) -> bool:
         """Atomically claim today's auto-update slot for this node. Returns
@@ -1158,6 +1171,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE agents ADD COLUMN last_auto_update TEXT")
         except sqlite3.Error:
             pass  # column already there (partial earlier migration)
+        # v7: the version pin (an operator's explicit downgrade).
+        for column in ("pinned_version TEXT", "pinned_ref TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE agents ADD COLUMN {column}")
+            except sqlite3.Error:
+                pass
         try:
             conn.execute(
                 "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
