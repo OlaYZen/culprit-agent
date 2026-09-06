@@ -347,7 +347,9 @@ class Reporter:
                     return _cmd_err(cmd_id, 404, "no such process (it may have exited)")
                 return {"id": cmd_id, "ok": True, "result": detail}
 
-            if action in ("terminate", "priority", "throttle"):
+            if action in ("terminate", "priority", "throttle", "truncate", "unit_action"):
+                # One switch for every verb that changes the machine: the
+                # name says "process", the meaning is "actions".
                 if not config_module.get().allow_process_actions:
                     return _cmd_err(cmd_id, 403,
                                     "process actions are disabled on this agent "
@@ -361,6 +363,20 @@ class Reporter:
                     # verb between renice and End task.
                     outcome = proc_mod.throttle(int(command["pid"]),
                                                 str(command.get("level")))
+                elif action == "truncate":
+                    # Frees a deleted-but-open file through the holder's own
+                    # descriptor; refuses anything that still has a name.
+                    outcome = proc_mod.truncate_deleted(int(command["pid"]),
+                                                        str(command.get("path") or ""))
+                elif action == "unit_action":
+                    # The Outage Doctor's verbs: systemctl restart / start /
+                    # reload-or-restart / reset-failed, with the same guards
+                    # the process actions have and the unit's state before
+                    # and after in the answer.
+                    from .collectors import units as units_mod
+                    outcome = units_mod.act(str(command.get("unit") or ""),
+                                            str(command.get("verb") or ""),
+                                            str(command.get("manager") or "system"))
                 else:
                     outcome = proc_mod.set_priority(int(command["pid"]),
                                                     str(command.get("level")))
