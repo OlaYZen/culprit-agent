@@ -41,6 +41,7 @@ from .collectors import cgroups as cgroups_mod
 from .collectors import kernel as kernel_mod
 from .collectors import memtrend as memtrend_mod
 from .collectors import outage as outage_mod
+from .collectors import prognosis as prognosis_mod
 from .collectors.changes import ChangeLog
 from .collectors.recorder import FlightRecorder
 from .collectors import sync as sync_mod
@@ -116,6 +117,10 @@ class Sampler:
         self.kernel: kernel_mod.KernelCollector | None = None
         self.ceilings: ceilings_mod.CeilingCollector | None = None
         self.outage: outage_mod.OutageCollector | None = None
+        # What is wearing out (the events tier): SMART, EDAC, AER, the SATA
+        # links, the batteries. Its ring lives beside the flight recorder so
+        # "rose since the last read" survives a restart.
+        self.prognosis: prognosis_mod.PrognosisCollector | None = None
         self.changes: ChangeLog | None = None
         # The memory-fill forecast: MemAvailable and every process's RSS over
         # the last hour, fitted on the proc tick for the Lag Doctor.
@@ -331,7 +336,8 @@ class Sampler:
                                       kernel=kernel, changes=self.changes,
                                       ceilings=self.store.get("ceilings"),
                                       ports=self.store.get("ports"),
-                                      memory_forecast=memory_forecast)
+                                      memory_forecast=memory_forecast,
+                                      prognosis=self.store.get("prognosis"))
 
         # Annotate unit main processes with the units they belong to.
         service_map = (self.store.get("services") or {}).get("by_pid") or {}
@@ -430,7 +436,7 @@ class Sampler:
         # events tick), so it runs after the rest and never re-collects.
         payload["outage"] = self.outage.sample(
             services, ports, volumes, self.store.get("events"), net_detail,
-            system, changes=self.changes)
+            system, changes=self.changes, prognosis=self.store.get("prognosis"))
         self.store.merge(payload)
         self.broker.publish("slow", payload)
 
@@ -447,6 +453,25 @@ class Sampler:
         if self.changes is not None:
             self.changes.observe_events(payload)
 
+        if self.prognosis is None:
+            self.prognosis = prognosis_mod.PrognosisCollector(
+                data_dir=str(self.recorder.path.parent) if self.recorder is not None
+                else None)
+        # The Prognosis reads hardware counters, so it takes nothing from this
+        # tick except identity: the disk list the slow tier already produced,
+        # the interface speeds from the fast tier, and mdstat from the proc
+        # tier. It re-collects nothing.
+        wear = self.prognosis.sample(
+            volumes=self.store.get("volumes"), network=self.store.get("network"),
+            kernel=self.store.get("kernel"), system=self.store.get("system"),
+            changes=self.changes,
+            settings={"enabled": cfg.prognosis_enabled,
+                      "smart_interval_minutes": cfg.prognosis_smart_interval_minutes,
+                      "wake_disks": cfg.prognosis_wake_disks})
+        self.store.put("prognosis", wear)
+        if self.changes is not None:
+            self.changes.observe_prognosis(wear)
+
         if self.history.ready:
             everything = (
                 list(payload["crashes"]["events"])
@@ -458,7 +483,9 @@ class Sampler:
                 log.debug("stored %d new event(s)", inserted)
             self.history.prune(cfg.retention_days)
 
-        self.broker.publish("events", payload)
+        # Both sections of this tier in one frame, the way the slow tier
+        # publishes its five: the browser applies them together or not at all.
+        self.broker.publish("events", {"events": payload, "prognosis": wear})
 
     # ----------------------------------------------------------------- rollup
     def _accumulate(self, timestamp: float, sample: dict) -> None:

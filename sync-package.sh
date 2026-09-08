@@ -27,7 +27,7 @@ rsync -a --delete \
   --exclude='__main__.py' --exclude='agent.py' --exclude='updater.py' \
   --exclude='expect.py' --exclude='notify.py' --exclude='verdict.py' \
   --exclude='coroner.py' --exclude='fleetmap.py' --exclude='portnames.py' --exclude='changelog.py'  \
-  --exclude='pulse.py' \
+  --exclude='pulse.py' --exclude='wear.py' \
   --exclude='__init__.py' \
   --exclude='__pycache__' --exclude='*.pyc' \
   "$src/" "$here/culprit/"

@@ -70,11 +70,49 @@ Sampler (4 loops)  -->  Store (latest payload per section)  -->  Reporter.push()
 
 ### Reporter behaviour worth knowing
 
-- **The flight recorder and deaths.** `run_agent` reads `data/flight-recorder.json.gz` (`recorder.detect_death`) *before* starting the sampler, then runs the sampler with a fresh `FlightRecorder` on the same path. A recording without a clean stop is a death: `_report_death` runs `forensics.investigate` in a thread and puts `{"coroner": {"deaths": [record]}}` in the store; `Reporter.push` clears it after the first successful report, so it costs one report. `Sampler.stop` marks the file `clean_stop` on SIGTERM/SIGINT, so a routine restart is never a death. The data directory (`agent.data_dir()`, `~/.local/share/culprit-agent`) must be writable and survive reboots.
+- **The flight recorder and deaths.** `run_agent` reads `data/flight-recorder.json.gz` (`recorder.detect_death`) *before* starting the sampler, then runs the sampler with a fresh `FlightRecorder` on the same path. A recording without a clean stop is a death: `_report_death` runs `forensics.investigate` in a thread and puts `{"coroner": {"deaths": [record]}}` in the store; `Reporter.push` clears it after the first successful report, so it costs one report. `Sampler.stop` marks the file `clean_stop` on SIGTERM/SIGINT, so a routine restart is never a death. The data directory (`agent.data_dir()`, `~/.local/share/culprit-agent`) must be writable and survive reboots. The Prognosis keeps its own small file there too, `prognosis.json` (mode 600): the last 8 reads of each hardware subject's counters, so *rose since the last read* survives an agent restart instead of waiting days for the host to have two daily rows. A corrupt or wrongly-shaped ring is ignored with a log line, never fatal -- it is a convenience, not a record.
 - **Delta reports.** Large sections listed in `_DELTA_SECTIONS` are only resent when the sampler has replaced the object (identity check via `id()`), so a 1s cadence costs a few KB/s. A full snapshot goes out every `_FULL_SYNC_S` (60s) regardless, and whenever the host replies `known: false`.
 - **Backoff, never death.** Failures retry with exponential backoff capped at 60s; sampling continues throughout. 401/403 logs a re-enroll hint and keeps crawling.
-- **Host-relayed commands.** The host's reply may carry `commands` (`process_detail`, `terminate`, `priority`, `throttle`, `truncate`, `unit_action`, `update`) and `settings` (`interval_fast`). Commands run against the live `ProcessCollector` (`truncate` = `processes.truncate_deleted`, freeing a deleted-but-open file through the holder's descriptor; `unit_action` = `collectors/units.py`'s `act`: `systemctl restart / start / reload-or-restart / reset-failed` with the same guards as the process actions and the unit's state before and after) and results are POSTed back immediately in a results-only report. Every verb that changes the machine -- unit actions included -- is gated by `Config.allow_process_actions`. Settings apply to the running sampler only and are never persisted.
+- **Host-relayed commands.** The host's reply may carry `commands` (`process_detail`, `terminate`, `priority`, `throttle`, `truncate`, `unit_action`, `update`) and `settings` (`interval_fast` for this machine; `prognosis_enabled`, `prognosis_smart_interval_minutes` and `prognosis_wake_disks` for the whole fleet -- the pace of a SMART pass is a host decision, and a push-only agent has exactly one downlink). Commands run against the live `ProcessCollector` (`truncate` = `processes.truncate_deleted`, freeing a deleted-but-open file through the holder's descriptor; `unit_action` = `collectors/units.py`'s `act`: `systemctl restart / start / reload-or-restart / reset-failed` with the same guards as the process actions and the unit's state before and after) and results are POSTed back immediately in a results-only report. Every verb that changes the machine -- unit actions included -- is gated by `Config.allow_process_actions`. Settings apply to the running sampler only and are never persisted.
 - **Self-update (`culprit/updater.py`).** `capability()` names exactly why this install cannot git-pull itself: `CULPRIT_AGENT_DOCKER` set, `Config.allow_remote_update` false, no `INVOCATION_ID` (not under systemd -- nothing would bring a bare `--run` back up), no `.git`, no `origin` remote, or a dirty working tree. Every git call goes through `_git()`, which passes `-c safe.directory=<config.ROOT>` (a root system service runs over a checkout some other user cloned; git refuses that without being told to trust it) and returns git's own stderr on failure rather than a guessed reason. Whether an update is *available* is not this module's job -- the host compares this agent's reported `version` against GitHub once for the whole fleet (`NodeRegistry.refresh_remote_version` on the host), not once per agent. `perform()` (only reached via the `"update"` command) does `git fetch` + `git reset --hard origin/<branch>` -- or, when the command carries `ref` (a sha the host resolved from its mirror of this repository, the way a downgrade to an older release is asked for), `git reset --hard <ref>` after checking the commit exists post-fetch and is an ancestor of `origin/<branch>` (never a jump off the branch); `SUPPORTS_REF` rides every agent meta as `update_refs`, so a host never sends a ref to an older build that would ignore it and update to the tip; the command's `branch` (the host's Settings > Automatic agent updates) is the line to end up on: after the fetch has shown `origin/<branch>` exists, a different branch than the checkout's is switched to with `git checkout -B <branch> origin/<branch>` (the tree is clean, capability() checked) before the reset, and the meta reports `update_branch` so the host can tell an agent on the wrong line from one merely behind (`updater.head_branch()`: `.git/HEAD` read on every report, no subprocess and not tied to the five-minute capability recheck, so a `git checkout` done by hand shows on the host with the next report) -- the repository itself is never the host's to choose, origin stays what the checkout was cloned from -- skips the restart entirely when that lands on the same commit, otherwise `pip install -r requirements-agent.txt` -- reverting the reset if that fails, so the checkout never runs ahead of what is actually installed. `Reporter._run_commands` restarts by setting its own `stopping` event (`loop.call_soon_threadsafe`, since `push()` runs in an executor thread) once the result has been posted, so `run_agent`'s normal shutdown path -- and `sampler.stop()`'s clean-stop mark -- still runs; a version number never gates whether `perform()` applies a change, only whether the host thinks it is worth asking for one.
+
+### The Prognosis (`collectors/prognosis.py`)
+
+Runs on the events tier and reads what the hardware itself keeps: one
+`smartctl -j -H -A -l selftest -n standby [-d type] /dev/X` per disk every
+`prognosis_smart_interval_minutes` (default 30), and a sysfs sweep every tick
+(~3 ms) over the ATA links, the physical interfaces, the EDAC controllers, the
+PCIe AER counters and the batteries. It produces `items[]` (the verdicts),
+`devices[]`, `links[]`, `nics[]`, `memory`, `pci[]`, `power[]` and `checks`.
+
+**Five rules the code keeps, each pinned by `tools/check_prognosis.py` in the
+host repo. Do not weaken any of them:**
+
+1. **Read only. Never a self-test, never a wake-up.** Every command line
+   carries `-n standby` unless the operator has set `prognosis_wake_disks`, so
+   a spun-down drive is `asleep: True` with the values from its last read and
+   is left asleep. There is no `-t` in the module at any setting -- this never
+   asks hardware to do work.
+2. **Standard attributes only, quoted by id.** The ids in `ATA_ATTRS` and the
+   NVMe health log as the specification defines it. Everything else the drive
+   reports lands in `devices[].smart.raw.vendor_attributes` and is never
+   judged: a vendor attribute means what that vendor says it means.
+3. **Rising beats non-zero beats absent**, and every source that cannot be read
+   is `available: False` with the exact unlock. `smart_access()` is the one
+   place that names it -- `sysinfo._access_map["smart"]` reads it rather than
+   keeping a second copy.
+4. **A guest says so.** A disk whose model matches `VIRTUAL_MODELS` is
+   `virtual: True` and judged never; `checks.guest.note` says to run an agent
+   on the hypervisor instead.
+5. **A forecast states its window** -- and the forecast itself is the host's
+   job (`wear.py` there), because it needs more days than an agent process
+   lives. `build_detail` renders both the agent's "unchanged across the 8 reads
+   this agent has made" and the host's "unchanged since 3 Aug", so the two
+   cannot drift apart.
+
+`SYSFS_ROOT` is the one injectable seam (the offline tool points the whole
+collector at a fixture tree); everything else in the module is pure functions
+over what those reads returned.
 
 ### Collectors
 

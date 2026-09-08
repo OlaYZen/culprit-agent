@@ -236,13 +236,15 @@ class LagAnalyzer:
                  changes: object = None,
                  ceilings: dict | None = None,
                  ports: dict | None = None,
-                 memory_forecast: dict | None = None) -> dict[str, object]:
+                 memory_forecast: dict | None = None,
+                 prognosis: dict | None = None) -> dict[str, object]:
         """Build the sustained-pressure findings and attribute them to processes.
 
         `cgroups` (per-unit pressure and limits), `kernel` (mdstat, per-core
         interrupts), `changes` (a ChangeLog), `ceilings` and `ports` (the port
-        map with its accept queues) and `memory_forecast` (memtrend's fit of
-        MemAvailable and per-process RSS) are optional: without them the
+        map with its accept queues), `memory_forecast` (memtrend's fit of
+        MemAvailable and per-process RSS) and `prognosis` (what the hardware's
+        own counters say is wearing out) are optional: without them the
         machine-level findings are exactly what they were.
         """
         cpu = snapshot.get("cpu") or {}
@@ -762,6 +764,10 @@ class LagAnalyzer:
                 except Exception:  # noqa: BLE001 -- never let the log break a diagnosis
                     finding["changes"] = []
 
+        # What the hardware under a storage finding is doing. Context, never
+        # blame: see _hardware_context.
+        _hardware_context(prognosis, candidates)
+
         candidates.sort(key=lambda f: (
             -SEVERITY_ORDER.index(str(f["severity"])),
             -float(f.get("sustained_ticks") or 0),
@@ -1244,6 +1250,73 @@ class LagAnalyzer:
             "next thing to read.",
             "disk", {"handlers": ", ".join(sorted(eh_active)) or None},
             blame="a storage device that stopped answering, not a process")
+
+
+# ------------------------------------------------------- hardware context
+# The storage findings whose cause can be a wearing disk rather than a
+# process. Each is machine-wide (one latency figure across every device), so
+# the join is "a disk on this machine is failing", never "this disk caused
+# this millisecond".
+_STORAGE_KEYS = ("psi_io", "disk_latency", "disk_queue", "disk_busy",
+                 "stuck_procs", "swap_slow", "scsi_recovery")
+# The Prognosis items worth saying under one, worst first.
+_HARDWARE_ITEMS = ("disk_failing:", "disk_cable:", "sata_downgraded:")
+
+
+def _hardware_context(prognosis: dict | None, findings: list[dict]) -> None:
+    """Name the disk under a storage finding -- and keep the culprits.
+
+    A failing disk does not make the process hammering it innocent: the IO is
+    still being asked for, and the ranking still answers "who is asking".
+    What changes is that the reader is told the medium underneath is giving
+    up, which no amount of process ranking would ever reveal. So this adds a
+    `hardware` block and one sentence, and touches nothing else.
+
+    The one exception is scsi_recovery, which is *already* external ("a
+    storage device that stopped answering, not a process"): there the blame
+    line gains the device's name, because a name is what it was missing.
+
+    A downgraded SATA link is deliberately not turned into external blame
+    here, although it has the shape of cpu_steal. A 1.5 Gbps link is a real
+    ceiling for an SSD and no ceiling at all for a spinning disk that cannot
+    reach 150 MB/s, and the machine-wide latency figure cannot say which
+    device it came from -- so the honest form is the sentence, not a verdict
+    that nobody on the machine is at fault.
+    """
+    if not isinstance(prognosis, dict) or not prognosis.get("available"):
+        return
+
+    def rank(item: dict) -> tuple[int, int] | None:
+        key = str(item.get("key") or "")
+        for index, prefix in enumerate(_HARDWARE_ITEMS):
+            if key.startswith(prefix):
+                return (-SEVERITY_ORDER.index(str(item.get("severity") or "info")),
+                        index)
+        return None
+
+    ranked = sorted(
+        ((rank(i), i) for i in (prognosis.get("items") or [])
+         if isinstance(i, dict) and rank(i) is not None),
+        key=lambda pair: pair[0])
+    if not ranked:
+        return
+    item = ranked[0][1]
+    device = (item.get("device") or {}).get("name") or item.get("subject")
+    for finding in findings:
+        if str(finding.get("key")) not in _STORAGE_KEYS:
+            continue
+        finding["hardware"] = {
+            "key": item.get("key"), "title": item.get("title"),
+            "subject": item.get("subject"), "severity": item.get("severity"),
+            "device": device,
+        }
+        finding["detail"] = (str(finding.get("detail") or "").rstrip()
+                             + f" The hardware under this is not well: {item.get('title')}"
+                               " -- see the Prognosis.")
+        if finding.get("external") and finding.get("blame"):
+            # scsi_recovery already says "a storage device"; now it can say
+            # which one.
+            finding["blame"] = f"{device}: {item.get('title')}"
 
 
 # --------------------------------------------------------------------- helpers

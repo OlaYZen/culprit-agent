@@ -259,6 +259,28 @@ def run(argv: list[str], timeout: float = 10.0) -> str | None:
     return completed.stdout
 
 
+def run_status(argv: list[str], timeout: float = 10.0) -> tuple[int, str] | None:
+    """(exit code, stdout) for a helper whose exit code is a *result*, not a
+    failure.
+
+    `run()` above treats a non-zero exit as "no output", which is right for
+    systemctl and lsblk. smartctl is the opposite: its exit code is a bitmask
+    of what it found (bit 1 = the device is in standby, bit 3 = the drive says
+    it is failing), and it prints perfectly good JSON alongside every one of
+    them. Throwing that output away because the exit code was non-zero would
+    discard exactly the reads that matter. None only when the command could
+    not be run at all.
+    """
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.debug("%s failed: %s", argv[0], exc)
+        return None
+    return completed.returncode, completed.stdout
+
+
 def run_json(argv: list[str], timeout: float = 10.0) -> object | None:
     text = run(argv, timeout=timeout)
     if not text:

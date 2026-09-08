@@ -634,11 +634,14 @@ def _label_for(source: str) -> str | None:
 
 
 def _block_media() -> list[dict[str, object]]:
-    """Identity per whole device from lsblk, plus honest health degradation.
+    """Identity per whole device from lsblk. Identity only.
 
-    smartctl/nvme-cli give real SMART data but need CAP_SYS_RAWIO or root (and
-    are frequently not installed); their absence is reported as *unknown*,
-    never as healthy.
+    Health used to be a `status` of None and a `smart_reason` explaining why
+    nothing had been read -- an honest non-answer, but still a non-answer.
+    The Prognosis reads the drive's own counters now
+    (collectors/prognosis.py), so health belongs there and the Storage view
+    joins the two by device name. Keeping a second, always-unknown copy here
+    would be one more thing to keep in step for no reader's benefit.
     """
     payload = linux.run_json([
         "lsblk", "--json", "-d", "-b",
@@ -646,7 +649,6 @@ def _block_media() -> list[dict[str, object]]:
     ])
     out: list[dict[str, object]] = []
     devices = (payload or {}).get("blockdevices") if isinstance(payload, dict) else None
-    smart_reason = _smart_unavailable_reason()
     for dev in devices or []:
         if dev.get("type") != "disk" or str(dev.get("name", "")).startswith(
                 ("loop", "ram", "zram")):
@@ -663,18 +665,5 @@ def _block_media() -> list[dict[str, object]]:
             "size": dev.get("size"),
             "serial": str(dev.get("serial") or "").strip() or None,
             "firmware": str(dev.get("rev") or "").strip() or None,
-            "status": None,
-            "smart_reason": smart_reason,
         })
     return out
-
-
-def _smart_unavailable_reason() -> str | None:
-    import shutil
-
-    if not (shutil.which("smartctl") or shutil.which("nvme")):
-        return ("smartctl / nvme-cli are not installed "
-                "(sudo apt install smartmontools nvme-cli)")
-    if os.geteuid() != 0 and "CAP_SYS_RAWIO" not in linux.capabilities():
-        return "SMART queries need CAP_SYS_RAWIO or root"
-    return None

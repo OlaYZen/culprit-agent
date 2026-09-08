@@ -91,7 +91,7 @@ class OutageCollector:
     # ----------------------------------------------------------------- sample
     def sample(self, services: dict | None, ports: dict | None, volumes: dict | None,
                events: dict | None, net_detail: dict | None, system: dict | None,
-               changes: Any = None) -> dict[str, Any]:
+               changes: Any = None, prognosis: dict | None = None) -> dict[str, Any]:
         started = time.perf_counter()
         now = time.time()
         items: list[dict[str, Any]] = []
@@ -104,7 +104,7 @@ class OutageCollector:
         items += self._dns(net_detail or {}, checks)
         items += self._mounts(volumes or {}, checks)
         items += self._boot(volumes or {}, checks)
-        items += self._disk_errors(events or {}, checks, now)
+        items += self._disk_errors(events or {}, checks, now, prognosis or {})
         items += self._reboot(events or {}, checks)
 
         live = {item["key"] for item in items}
@@ -472,7 +472,8 @@ class OutageCollector:
         }]
 
     # ------------------------------------------------------------ disk errors
-    def _disk_errors(self, events: dict, checks: dict[str, Any], now: float) -> list[dict[str, Any]]:
+    def _disk_errors(self, events: dict, checks: dict[str, Any], now: float,
+                     prognosis: dict | None = None) -> list[dict[str, Any]]:
         crashes = ((events.get("crashes") or {}).get("events")) or []
         recent = [e for e in crashes if isinstance(e, dict) and e.get("source_key") == "disk_error"
                   and float(e.get("timestamp") or 0) >= now - 86400]
@@ -483,15 +484,34 @@ class OutageCollector:
         if not recent:
             return []
         latest = recent[0]
+        # If the Prognosis has already read the drive's own counters, this
+        # item stops telling the operator to go and look at SMART and says
+        # what SMART said instead: "check SMART" and "this disk is failing"
+        # are one story, and printing the first while the second is on the
+        # next page is the kind of gap this project exists to close.
+        wear = _wearing_disk(prognosis)
+        detail = (f"The kernel logged \"{latest.get('title')}\" at "
+                  f"{time.strftime('%H:%M', time.localtime(float(latest.get('timestamp') or now)))}. "
+                  "IO errors precede a remount read-only and a dead disk")
+        evidence: dict[str, Any] = {"errors_24h": len(recent),
+                                    "latest": latest.get("timestamp")}
+        if wear:
+            detail += (f". The Prognosis has the drive's own answer: {wear['title']}. "
+                       "Back up before anything else.")
+            evidence["prognosis"] = wear["title"]
+            fix = (f"back up what is on it; smartctl -a /dev/{wear['device']} to confirm "
+                   "what the Prognosis already read")
+        else:
+            detail += "; check SMART and back up first."
+            fix = ("dmesg -T | grep -iE 'I/O error|EXT4-fs error|nvme|ata'; "
+                   "smartctl -a on the device; back up")
         return [{
             "key": "disk_errors", "kind": "storage", "severity": "warn",
             "title": f"Storage reported {len(recent)} error{'s' if len(recent) != 1 else ''} in the last 24 h",
-            "detail": f"The kernel logged \"{latest.get('title')}\" at "
-                      f"{time.strftime('%H:%M', time.localtime(float(latest.get('timestamp') or now)))}. "
-                      "IO errors precede a remount read-only and a dead disk; check SMART and back up first.",
+            "detail": detail,
             "root": {"unit": None, "result": None, "line": None, "chain": []},
-            "fix": "dmesg -T | grep -iE 'I/O error|EXT4-fs error|nvme|ata'; smartctl -a on the device; back up",
-            "evidence": {"errors_24h": len(recent), "latest": latest.get("timestamp")},
+            "fix": fix,
+            "evidence": evidence,
         }]
 
     # ----------------------------------------------------------------- reboot
@@ -511,6 +531,26 @@ class OutageCollector:
             "fix": "schedule the reboot (or restart the listed services)",
             "evidence": {"reasons": reasons},
         }]
+
+
+def _wearing_disk(prognosis: dict | None) -> dict[str, Any] | None:
+    """The worst disk the Prognosis has an item for, if it has read any. Read
+    only -- the Outage Doctor quotes it and never re-judges it."""
+    if not isinstance(prognosis, dict) or not prognosis.get("available"):
+        return None
+    best = None
+    for item in prognosis.get("items") or []:
+        if not isinstance(item, dict) or item.get("kind") != "disk":
+            continue
+        if not str(item.get("key") or "").startswith("disk_failing:"):
+            continue
+        if best is None or _SEV.get(str(item.get("severity")), 0) > _SEV.get(
+                str(best.get("severity")), 0):
+            best = item
+    if best is None:
+        return None
+    return {"title": best.get("title"),
+            "device": (best.get("device") or {}).get("name") or best.get("subject")}
 
 
 # ------------------------------------------------------------- unit roots

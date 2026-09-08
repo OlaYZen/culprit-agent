@@ -185,6 +185,26 @@ class Config:
     # rounding difference.
     pulse_timer_grace_minutes: int = 15
 
+    # --- the Prognosis ----------------------------------------------------
+    # What is wearing out, read from the hardware's own counters. The first
+    # two are agent settings: they are relayed to every agent in the response
+    # to its report (the same downlink the Refresh control uses), because the
+    # cadence of a SMART pass is a fleet decision, not a per-machine one.
+    prognosis_enabled: bool = True
+    # One `smartctl -j` per disk this often. Half an hour is chosen so a
+    # rising counter is seen the same day without a spun-up drive paying for
+    # the privilege every couple of minutes.
+    prognosis_smart_interval_minutes: int = 30
+    # Off by default, and the rule the whole collector is built around: a
+    # sleeping disk is read as "asleep, last values kept", never woken. An
+    # operator with an always-on array can turn this on; an operator with an
+    # archive shelf must not have it on by accident.
+    prognosis_wake_disks: bool = False
+    # The wear table's own retention (host only). Deliberately neither
+    # retention_days nor pulse_retention_days: an endurance forecast is fitted
+    # over months, and one row per device per day is nothing to keep.
+    wear_retention_days: int = 400
+
     # --- ui ---
     ui: dict[str, Any] = field(default_factory=dict)
 
@@ -246,6 +266,8 @@ EDITABLE = {
     "notify_min_severity", "notify_resolved", "notify_offline",
     "pulse_enabled", "pulse_retention_days", "pulse_quiet_ratio",
     "pulse_hold_minutes", "pulse_timer_grace_minutes",
+    "prognosis_enabled", "prognosis_smart_interval_minutes",
+    "prognosis_wake_disks", "wear_retention_days",
 }
 
 # Text fields with a shape: the validator returns the cleaned value or
@@ -341,6 +363,8 @@ LIMITS: dict[str, tuple[float, float]] = {
     "pulse_quiet_ratio": (0.05, 0.9),
     "pulse_hold_minutes": (10, 240),
     "pulse_timer_grace_minutes": (1, 1440),
+    "prognosis_smart_interval_minutes": (5, 1440),
+    "wear_retention_days": (60, 3650),
 }
 
 

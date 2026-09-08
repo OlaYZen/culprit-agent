@@ -60,6 +60,11 @@ class ChangeLog:
         self._containers: dict[str, str] | None = None
         self._limits: dict[str, tuple[float | None, int | None]] | None = None
         self._packages: set[str] | None = None
+        # Hardware, from the Prognosis: which disks are present (by serial),
+        # what each physical link negotiated, and which wear items exist.
+        self._disks: dict[str, str] | None = None
+        self._speeds: dict[str, int] | None = None
+        self._wear: set[str] | None = None
         self._sessions: dict[str, dict] | None = None
         self._primed = False                 # first process tick seen
         self._proc_reported: set[int] = set()
@@ -340,6 +345,60 @@ class ChangeLog:
                               + (f" from {host}" if host else ""),
                               None, subject=str(user), exact=False)
             self._sessions = current_sessions
+
+    def observe_prognosis(self, payload: dict | None) -> None:
+        """Hardware, from the events tier (2 min).
+
+        Three facts nothing else here keeps a time for: a disk that appeared
+        or went away (by serial, so a replacement is a swap and not a
+        recovery), a physical link that renegotiated, and a wear item that
+        started. They matter because the Prognosis's own `since` is the first
+        time the *agent* saw the item -- these say what happened around it.
+        """
+        if not payload or not payload.get("available"):
+            return
+        now = time.time()
+        disks = {str(d.get("subject")): str(d.get("name") or d.get("subject"))
+                 for d in (payload.get("devices") or []) if isinstance(d, dict)
+                 and d.get("subject") and not d.get("virtual")}
+        speeds = {str(n.get("name")): int(n["speed_mbps"])
+                  for n in (payload.get("nics") or []) if isinstance(n, dict)
+                  and isinstance(n.get("speed_mbps"), int) and n.get("up")}
+        items = {str(i.get("key")): i for i in (payload.get("items") or [])
+                 if isinstance(i, dict) and i.get("key")}
+        with self._lock:
+            if self._disks is not None:
+                for subject, name in disks.items():
+                    if subject not in self._disks:
+                        self._add(now, "disk_added", "hardware",
+                                  f"{name} appeared", f"serial {subject}",
+                                  subject=name, exact=False)
+                for subject, name in self._disks.items():
+                    if subject not in disks:
+                        self._add(now, "disk_removed", "hardware",
+                                  f"{name} is no longer present",
+                                  f"serial {subject}", severity="warn",
+                                  subject=name, exact=False)
+            self._disks = disks
+            if self._speeds is not None:
+                for name, speed in speeds.items():
+                    was = self._speeds.get(name)
+                    if was is not None and was != speed:
+                        self._add(now, "link_speed", "hardware",
+                                  f"{name} renegotiated at {speed} Mbit/s",
+                                  f"was {was} Mbit/s",
+                                  severity="warn" if speed < was else "info",
+                                  subject=name, exact=False)
+            self._speeds = speeds
+            if self._wear is not None:
+                for key, item in items.items():
+                    if key in self._wear:
+                        continue
+                    self._add(now, "wear", "hardware",
+                              str(item.get("title") or key)[:200], None,
+                              severity=str(item.get("severity") or "warn"),
+                              subject=str(item.get("subject") or ""), exact=False)
+            self._wear = set(items)
 
     def observe_processes(self, processes: list[dict]) -> None:
         """Newcomers that stayed. Called every proc tick with the full table.

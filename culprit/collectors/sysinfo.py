@@ -24,6 +24,7 @@ import psutil
 
 from .. import linux
 from ..util import is_elevated
+from . import prognosis
 
 log = logging.getLogger("culprit.sysinfo")
 
@@ -153,8 +154,10 @@ def _access_map() -> dict[str, object]:
                        "needs": "CAP_SYS_PTRACE for other users' "
                                 "/proc/<pid>/io and fd counts",
                        "ptrace_scope": linux.ptrace_scope()},
-        "smart": {"ok": os.geteuid() == 0 or "CAP_SYS_RAWIO" in caps,
-                  "needs": "CAP_SYS_RAWIO or root for SMART health"},
+        # Two halves, named separately: "install smartmontools" and "run as
+        # root" are different jobs, and the Prognosis's checks strip quotes
+        # this rather than keeping a second copy of the wording.
+        "smart": prognosis.smart_access(),
         "dmi_serial": {"ok": os.geteuid() == 0, "needs": "root"},
         "btmp": {"ok": os.access("/var/log/btmp", os.R_OK),
                  "needs": "root (or utmp group) for failed-login records"},

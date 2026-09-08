@@ -32,7 +32,7 @@ from typing import Any, Iterable, Sequence
 
 log = logging.getLogger("culprit.db")
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 ROLES = ("viewer", "operator", "admin")
 
@@ -243,6 +243,23 @@ CREATE TABLE IF NOT EXISTS pulse_runs (
     PRIMARY KEY (node, timer, started)
 ) WITHOUT ROWID;
 
+-- The Prognosis's wear record: one row per device per day, holding that
+-- day's judged counters. This is the only place a *slope* can come from --
+-- the agent's own ring is eight reads deep and dies with the process, and
+-- "84 % used, 100 % in February" needs months. One row per disk per day is
+-- under 4 000 rows a year for a ten-disk box, which is why the retention is
+-- 400 days rather than the metric history's seven.
+CREATE TABLE IF NOT EXISTS wear (
+    node     TEXT    NOT NULL,
+    day      INTEGER NOT NULL,   -- host-local midnight, epoch seconds
+    kind     TEXT    NOT NULL,   -- disk | link | nic | memory | pci | power
+    subject  TEXT    NOT NULL,   -- the serial, the mc, the BDF, the interface
+    counters TEXT    NOT NULL,   -- JSON: the judged counters, nothing else
+    PRIMARY KEY (node, day, kind, subject)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_wear_subject ON wear(node, kind, subject, day);
+
 -- Dashboard users. Passwords are scrypt-hashed with a per-user salt; the
 -- plaintext never touches the database.
 CREATE TABLE IF NOT EXISTS users (
@@ -310,6 +327,7 @@ class History:
         self._conn: sqlite3.Connection | None = None
         self._last_prune = 0.0
         self._last_pulse_prune = 0.0
+        self._last_wear_prune = 0.0
         self.error: str | None = None
         if enabled:
             self._open()
@@ -793,6 +811,72 @@ class History:
             "FROM pulse WHERE node = ?", (node,))
         return dict(rows[0]) if rows else {"oldest": None, "newest": None, "buckets": 0}
 
+    # --------------------------------------------------------------------- wear
+    def write_wear(self, node: str, day: int,
+                   rows: Sequence[tuple[str, str, dict[str, Any]]]) -> int:
+        """Store one day's counters per device. INSERT OR REPLACE: the latest
+        read of the day wins, so a day holds the newest numbers rather than
+        whatever happened to be first after midnight."""
+        if not self.ready or not self.recording or not rows:
+            return 0
+        payload = [(node, int(day), kind, subject,
+                    json.dumps(counters, separators=(",", ":")))
+                   for kind, subject, counters in rows]
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return 0
+            try:
+                cursor = conn.executemany(
+                    "INSERT OR REPLACE INTO wear (node, day, kind, subject, counters) "
+                    "VALUES (?, ?, ?, ?, ?)", payload)
+                conn.commit()
+                return cursor.rowcount or 0
+            except (sqlite3.Error, ValueError, TypeError) as exc:
+                log.warning("wear write failed: %s", exc)
+                return 0
+
+    def wear_rows(self, node: str, kind: str, subject: str,
+                  since: float | None = None) -> list[dict[str, Any]]:
+        """One subject's daily counters, oldest first -- what the forecast is
+        fitted over and what the chart draws."""
+        if not self.ready:
+            return []
+        out: list[dict[str, Any]] = []
+        for row in self._query(
+                "SELECT day, counters FROM wear WHERE node = ? AND kind = ? "
+                "AND subject = ? AND day >= ? ORDER BY day",
+                (node, kind, subject,
+                 int(since if since is not None else time.time() - 400 * 86_400))):
+            try:
+                counters = json.loads(row["counters"])
+            except (ValueError, TypeError):
+                continue
+            if isinstance(counters, dict):
+                out.append({"day": int(row["day"]), "counters": counters})
+        return out
+
+    def wear_subjects(self, node: str) -> list[dict[str, Any]]:
+        """What this node has a wear record for, and how many days of one."""
+        if not self.ready:
+            return []
+        return [dict(row) for row in self._query(
+            "SELECT kind, subject, COUNT(*) AS days, MIN(day) AS first_seen, "
+            "MAX(day) AS last_seen FROM wear WHERE node = ? "
+            "GROUP BY kind, subject ORDER BY kind, subject", (node,))]
+
+    def prune_wear(self, retention_days: int) -> None:
+        """Drop wear rows past their own retention. Rate-limited to once an
+        hour, like every other prune here."""
+        if not self.ready:
+            return
+        now = time.time()
+        if now - self._last_wear_prune < 3600:
+            return
+        self._last_wear_prune = now
+        self._execute("DELETE FROM wear WHERE day < ?",
+                      (now - max(1, int(retention_days)) * 86_400,))
+
     def prune_pulse(self, retention_days: int) -> None:
         """Drop rhythm buckets past their own retention. Separate from
         prune(): the rhythm needs weeks where the metric history needs days,
@@ -1070,7 +1154,7 @@ class History:
             return {"available": False, "reason": self.error or "history disabled"}
         counts: dict[str, Any] = {}
         for table in ("samples", "proc_samples", "events", "findings", "actions",
-                      "deaths", "pulse", "pulse_runs"):
+                      "deaths", "pulse", "pulse_runs", "wear"):
             rows = self._query(f"SELECT COUNT(*) AS n FROM {table}")
             counts[table] = rows[0]["n"] if rows else 0
         span = self._query("SELECT MIN(ts) AS oldest, MAX(ts) AS newest FROM samples")
@@ -1360,6 +1444,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # v9: the operator's word that the machine is not always on.
         # v10: the Pulse's hourly activity buckets (a new table only).
         # v11: the runs of each timer's service (a new table only).
+        # v12: the Prognosis's wear rows (a new table only).
         for column in ("pinned_version TEXT", "pinned_ref TEXT", "platform TEXT",
                        "intermittent INTEGER NOT NULL DEFAULT 0"):
             try:

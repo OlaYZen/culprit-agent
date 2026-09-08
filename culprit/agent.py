@@ -409,9 +409,17 @@ class Reporter:
             return _cmd_err(cmd_id, 500, str(exc))
 
     def _apply_settings(self, settings: dict) -> None:
-        """Overrides the host handed back with its response -- the Refresh
-        control on the dashboard lands here. Applied like the host applies its
-        own titlebar control: to the running sampler only, never persisted."""
+        """Overrides the host handed back with its response.
+
+        Two kinds arrive on the one downlink a push-only agent has. The
+        Refresh control on the dashboard sends `interval_fast` for this
+        machine; the Prognosis's settings are fleet-wide configuration, and
+        the host sends them to every agent because the cadence of a SMART
+        pass is not a per-machine decision. Both are applied to the running
+        sampler only, never persisted -- a restart on either side reverts to
+        this checkout's defaults.
+        """
+        self._apply_prognosis(settings)
         fast = settings.get("interval_fast")
         if fast is None:
             return
@@ -436,6 +444,32 @@ class Reporter:
         if changed:
             log.info("host set sampling to %.2gs (reporting every %.2gs)",
                      fast, self.interval)
+
+    def _apply_prognosis(self, settings: dict) -> None:
+        """The three the host decides for the whole fleet. `wake_disks` is the
+        one that costs something real -- with it off a sleeping disk is
+        reported asleep and left alone -- so it is applied exactly as sent and
+        never inferred."""
+        patch: dict = {}
+        for key, kind in (("prognosis_enabled", bool),
+                          ("prognosis_wake_disks", bool),
+                          ("prognosis_smart_interval_minutes", int)):
+            value = settings.get(key)
+            if value is None:
+                continue
+            try:
+                value = kind(value)
+            except (TypeError, ValueError):
+                continue
+            if getattr(config_module.get(), key, None) != value:
+                patch[key] = value
+        if not patch:
+            return
+        _, errors = config_module.update(patch, persist=False)
+        if errors:
+            log.warning("host asked for %r: %s", patch, errors)
+            return
+        log.info("host set %s", ", ".join(f"{k}={v}" for k, v in patch.items()))
 
     @property
     def delay(self) -> float:
