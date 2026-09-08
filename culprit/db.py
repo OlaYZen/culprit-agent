@@ -32,7 +32,7 @@ from typing import Any, Iterable, Sequence
 
 log = logging.getLogger("culprit.db")
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 ROLES = ("viewer", "operator", "admin")
 
@@ -222,6 +222,26 @@ CREATE TABLE IF NOT EXISTS pulse (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_pulse_subject ON pulse(node, kind, subject, ts);
+
+-- One row per run of a timer's service: when it started, when it ended, how
+-- long it took, how it ended, and how many bytes it moved while it ran. The
+-- rhythm buckets answer "is this subject as busy as usual"; this answers the
+-- other half -- "did the job that ran actually do anything" -- which is the
+-- only way to see a backup that exits 0 in four seconds because its target
+-- mount is gone. Keyed by the run's own start, so re-reading the same run
+-- (every slow tick until the next one) updates rather than duplicates.
+CREATE TABLE IF NOT EXISTS pulse_runs (
+    node       TEXT    NOT NULL,
+    timer      TEXT    NOT NULL,
+    started    INTEGER NOT NULL,   -- epoch seconds
+    unit       TEXT,               -- the activated unit
+    ended      REAL,
+    duration_s REAL,
+    status     INTEGER,
+    result     TEXT,
+    io_bytes   REAL,               -- integrated from the unit's own ring; NULL when unwatched
+    PRIMARY KEY (node, timer, started)
+) WITHOUT ROWID;
 
 -- Dashboard users. Passwords are scrypt-hashed with a per-user salt; the
 -- plaintext never touches the database.
@@ -693,6 +713,42 @@ class History:
                 log.warning("pulse write failed: %s", exc)
                 return 0
 
+    def write_pulse_runs(self, rows: Sequence[tuple]) -> int:
+        """Store timer runs. REPLACE, not IGNORE: a run is first seen while it
+        is still going (no end, no duration) and seen again when it finishes,
+        and the finished record is the true one."""
+        if not self.ready or not self.recording or not rows:
+            return 0
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return 0
+            try:
+                cursor = conn.executemany(
+                    "INSERT OR REPLACE INTO pulse_runs "
+                    "(node, timer, started, unit, ended, duration_s, status, result, io_bytes) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                conn.commit()
+                return cursor.rowcount or 0
+            except (sqlite3.Error, ValueError, TypeError) as exc:
+                log.warning("pulse run write failed: %s", exc)
+                return 0
+
+    def pulse_runs(self, node: str, since: float | None = None,
+                   limit: int = 400) -> dict[str, list[dict[str, Any]]]:
+        """Recent runs per timer for one node, newest first within each timer."""
+        if not self.ready:
+            return {}
+        rows = self._query(
+            "SELECT timer, started, unit, ended, duration_s, status, result, io_bytes "
+            "FROM pulse_runs WHERE node = ? AND started >= ? "
+            "ORDER BY started DESC LIMIT ?",
+            (node, int(since if since is not None else time.time() - 90 * 86400), limit))
+        out: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            out.setdefault(str(row["timer"]), []).append(dict(row))
+        return out
+
     def pulse_at_hours(self, node: str,
                        hours: Sequence[int]) -> list[dict[str, Any]]:
         """Every subject's buckets at the given hour starts -- the baseline
@@ -747,8 +803,12 @@ class History:
         if now - self._last_pulse_prune < 3600:
             return
         self._last_pulse_prune = now
-        self._execute("DELETE FROM pulse WHERE ts < ?",
-                      (now - max(1, int(retention_days)) * 86_400,))
+        cutoff = now - max(1, int(retention_days)) * 86_400
+        self._execute("DELETE FROM pulse WHERE ts < ?", (cutoff,))
+        # Runs are kept longer than the hourly rhythm: ten runs of a weekly
+        # timer are ten weeks of history, and they are a handful of rows.
+        self._execute("DELETE FROM pulse_runs WHERE started < ?",
+                      (now - max(90, int(retention_days) * 2) * 86_400,))
 
     # ------------------------------------------------------------------ changes
     def write_changes(self, events: Iterable[dict[str, Any]],
@@ -1010,7 +1070,7 @@ class History:
             return {"available": False, "reason": self.error or "history disabled"}
         counts: dict[str, Any] = {}
         for table in ("samples", "proc_samples", "events", "findings", "actions",
-                      "deaths", "pulse"):
+                      "deaths", "pulse", "pulse_runs"):
             rows = self._query(f"SELECT COUNT(*) AS n FROM {table}")
             counts[table] = rows[0]["n"] if rows else 0
         span = self._query("SELECT MIN(ts) AS oldest, MAX(ts) AS newest FROM samples")
@@ -1299,6 +1359,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # v8: the agent's platform.
         # v9: the operator's word that the machine is not always on.
         # v10: the Pulse's hourly activity buckets (a new table only).
+        # v11: the runs of each timer's service (a new table only).
         for column in ("pinned_version TEXT", "pinned_ref TEXT", "platform TEXT",
                        "intermittent INTEGER NOT NULL DEFAULT 0"):
             try:

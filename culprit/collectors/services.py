@@ -28,6 +28,7 @@ import re
 import time
 
 from .. import linux
+from . import cron as cron_mod
 
 log = logging.getLogger("culprit.services")
 
@@ -53,6 +54,17 @@ _BOOT_TARGETS = frozenset({"sysinit.target", "basic.target", "local-fs.target",
                            "emergency.target", "initrd.target", "shutdown.target"})
 _FINISHED_LINE = r"Finished |Deactivated successfully|Succeeded\."
 
+# Per-unit journal rate: a trailing window read on the slow tick, overlapping
+# on purpose -- a rate over 20 s of a unit that logs once a minute is noise,
+# and the Pulse compares this with the same window from other days. Measured
+# on the dev box (1.3 GB journal, a hammered sshd): ~10 ms warm.
+_JOURNAL_WINDOW_S = 120
+# Above this many lines in the window the counts stop being per-unit truth
+# (journalctl returns the newest N, so a chatty unit hides a quiet one), and
+# the whole source reports unavailable rather than inventing a silence.
+_JOURNAL_MAX_LINES = 8000
+_CRON_REFRESH_S = 300.0
+
 
 class ServiceCollector:
     def __init__(self) -> None:
@@ -63,6 +75,12 @@ class ServiceCollector:
         # an inactive unit and `systemctl show` then reports no timestamps,
         # so a boot job that finished needs its journal line to prove it.
         self._exit_cache: dict[str, tuple[float | None, float | None]] = {}
+        # Cron is read on its own cadence: the schedules come from files, but
+        # "when did it last run" is a journal read (~0.8 s here), and a job's
+        # last run does not change between slow ticks.
+        self._cron: list[dict[str, object]] = []
+        self._cron_reason: str | None = None
+        self._cron_at = 0.0
 
     def sample(self) -> dict[str, object]:
         system = self._scope("system")
@@ -82,14 +100,30 @@ class ServiceCollector:
 
         services = system["services"] + user["services"]
         boot_time = _boot_time()
+        # Listed before the journal fallback runs: a timer's activated unit is
+        # usually a oneshot that systemd has unloaded between runs, which is
+        # exactly the case the fallback exists for.
+        listed_timers = self._list_timers()
+        activated = {str(t.get("activates")) for t in listed_timers if t.get("activates")}
         for service in services:
-            if _boot_job_candidate(service) and service.get("exited_at") is None:
+            if (_boot_job_candidate(service) or str(service["name"]) in activated) \
+                    and service.get("exited_at") is None:
                 name = str(service["name"])
                 if name not in self._exit_cache:
                     self._exit_cache[name] = _journal_run(name, str(service.get("scope")))
                 service["started_at"], service["exited_at"] = self._exit_cache[name]
             elif service.get("active_state") != "inactive":
                 self._exit_cache.pop(str(service["name"]), None)
+        rates, rates_reason = _journal_rates()
+        for service in services:
+            if rates is None:
+                service["lines_sec"] = None
+                continue
+            key = (f"user:{service['name']}" if service.get("scope") == "user"
+                   else str(service["name"]))
+            # A unit with no lines in the window logged nothing: that is a
+            # zero, not a gap. `None` is reserved for "not readable".
+            service["lines_sec"] = rates.get(key, 0.0)
         problems = _find_problems(services, boot_time=boot_time)
         problems.sort(key=lambda p: (0 if p["severity"] == "critical" else 1,
                                      str(p["display_name"] or p["name"])))
@@ -124,8 +158,15 @@ class ServiceCollector:
             "summary": summary,
             "problems": problems,
             "by_pid": by_pid,
-            "timers": self._timers(),
+            "timers": _timer_rows(listed_timers, services) + self._cron_jobs(),
             "cgroup_attribution": linux.cgroup_version() == 2,
+            # Whether services[].lines_sec means anything, and why not.
+            "journal_rate": rates is not None,
+            "journal_rate_reason": rates_reason,
+            "journal_rate_window_s": _JOURNAL_WINDOW_S,
+            # What cron could not be read, if anything (per-user crontabs are
+            # root:crontab 1730 and invisible to an unprivileged agent).
+            "cron_reason": self._cron_reason,
             "user_bus": user["available"],
             "user_bus_reason": user["reason"],
         }
@@ -295,22 +336,128 @@ class ServiceCollector:
                     max(0.0, (read_b - prev_io[1] + write_b - prev_io[2]) / dt))
         return out
 
-    def _timers(self) -> list[dict[str, object]]:
-        """Scheduled jobs. A timer whose service failed on its last run is a
-        real signal that Windows Task Scheduler made very hard to see."""
+    def _cron_jobs(self) -> list[dict[str, object]]:
+        """Cron's schedules in the timer shape, refreshed every five minutes."""
+        now = time.monotonic()
+        if now - self._cron_at > _CRON_REFRESH_S or not self._cron:
+            try:
+                self._cron, self._cron_reason = cron_mod.jobs()
+            except Exception as exc:  # noqa: BLE001 -- one optional source
+                log.debug("cron read failed: %s", exc)
+                self._cron, self._cron_reason = [], f"cron could not be read ({exc})"
+            self._cron_at = now
+        return list(self._cron)
+
+    def _list_timers(self) -> list[dict[str, object]]:
+        """`systemctl list-timers` as it comes: unit, what it activates, and
+        the two stamps systemd keeps (microsecond epochs)."""
         listed = linux.run_json(
             ["systemctl", "list-timers", "--all", "-o", "json", "--no-pager"],
             timeout=10)
-        out = []
-        for timer in listed if isinstance(listed, list) else []:
-            out.append({
-                "unit": timer.get("unit"),
-                "activates": timer.get("activates"),
-                # systemd reports microsecond epoch stamps.
-                "next": _usec(timer.get("next")),
-                "last": _usec(timer.get("last")),
-            })
-        return out
+        return [t for t in (listed if isinstance(listed, list) else [])
+                if isinstance(t, dict)]
+
+
+def _journal_rates() -> tuple[dict[str, float] | None, str | None]:
+    """Journal lines per second per unit over the trailing window.
+
+    The one signal that says an application *stopped working* while its unit
+    stays perfectly active: a daemon that deadlocks keeps its PID, its port
+    and its cgroup, and goes quiet in the log. Only the unit field is
+    requested, so the messages themselves are never read here -- nothing is
+    parsed, only counted.
+    """
+    entries = linux.journalctl_json(
+        ["--since", f"-{_JOURNAL_WINDOW_S}s",
+         "--output-fields=_SYSTEMD_UNIT,_SYSTEMD_USER_UNIT"],
+        timeout=15, max_entries=_JOURNAL_MAX_LINES)
+    if not entries:
+        # An empty window is not proof of a readable journal: a gated one
+        # returns nothing too. `journal` in sysinfo's access map is the place
+        # that says which, so this only reports the honest ambiguity.
+        access = linux.journal_access()
+        if access.get("readable"):
+            return {}, None          # a genuinely silent two minutes
+        return None, str(access.get("reason")
+                         or "the system journal is not readable by this agent")
+    if len(entries) >= _JOURNAL_MAX_LINES:
+        return None, (f"more than {_JOURNAL_MAX_LINES} lines in {_JOURNAL_WINDOW_S}s: "
+                      "the newest are all journalctl returns, so a quiet unit "
+                      "cannot be told from one crowded out")
+    # A user unit and a system unit can share a name (dbus.service is both),
+    # so user lines are counted under their own key -- one unit must never be
+    # credited with another's log.
+    counts: dict[str, int] = {}
+    for entry in entries:
+        user_unit = entry.get("_SYSTEMD_USER_UNIT")
+        unit = entry.get("_SYSTEMD_UNIT")
+        key = (f"user:{user_unit}" if isinstance(user_unit, str) and user_unit
+               else unit if isinstance(unit, str) and unit else None)
+        if key:
+            counts[key] = counts.get(key, 0) + 1
+    return {unit: round(n / _JOURNAL_WINDOW_S, 4) for unit, n in counts.items()}, None
+
+
+# --------------------------------------------------------------------- timers
+def _timer_rows(listed: list[dict[str, object]],
+                services: list[dict]) -> list[dict[str, object]]:
+    """Scheduled jobs, each with **its last run**.
+
+    A timer whose service failed on its last run is a real signal that Windows
+    Task Scheduler made very hard to see -- and *how long the run took* is a
+    second one that nothing else reports: a backup that normally runs twenty
+    minutes and "succeeded" in four seconds did not back anything up. The run
+    is joined from the activated unit's own properties, which the batched
+    `systemctl show` already read, so this costs no extra call.
+    """
+    by_name = {str(s["name"]): s for s in services}
+    out = []
+    for timer in listed:
+        activates = timer.get("activates")
+        service = by_name.get(str(activates or ""))
+        run, reason = _run_of(service) if service is not None else (
+            None, "the unit this activates is not loaded, so systemd keeps no "
+                  "record of its last run")
+        out.append({
+            "unit": timer.get("unit"),
+            "activates": activates,
+            # systemd reports microsecond epoch stamps.
+            "next": _usec(timer.get("next")),
+            "last": _usec(timer.get("last")),
+            "run": run,
+            "run_reason": reason,
+        })
+    return out
+
+
+def _run_of(service: dict) -> tuple[dict[str, object] | None, str | None]:
+    """The activated unit's last (or current) run, or why there is none.
+
+    `ExecMainExitTimestamp` is empty while the main process lives, which is
+    what separates a run still going from one that finished: a duration is
+    only ever reported for a run that ended, and the one in flight reports
+    how long it has been going instead. Nothing is inferred from a missing
+    stamp -- a unit that has never run says so.
+    """
+    started = service.get("started_at")
+    ended = service.get("exited_at")
+    if not isinstance(started, (int, float)):
+        return None, "this unit has not run since the last boot"
+    running = ended is None and str(service.get("active_state")) in (
+        "active", "activating", "reloading", "deactivating")
+    duration = None
+    if isinstance(ended, (int, float)) and ended >= started:
+        duration = round(float(ended) - float(started), 3)
+    return {
+        "started": float(started),
+        "ended": float(ended) if isinstance(ended, (int, float)) else None,
+        # Set only for a run that ended; a run in flight carries elapsed.
+        "duration_s": duration,
+        "elapsed_s": round(time.time() - float(started), 1) if running else None,
+        "status": service.get("exit_status"),
+        "result": service.get("result"),
+        "running": running,
+    }, None
 
 
 # --------------------------------------------------------------------- mapping
