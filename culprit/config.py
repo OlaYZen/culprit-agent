@@ -164,6 +164,27 @@ class Config:
     notify_resolved: bool = True       # send a follow-up when a finding clears
     notify_offline: bool = True        # send when an agent stops reporting
 
+    # --- the Pulse (host only) --------------------------------------------
+    # The doctor for absence: what stopped happening, judged against the
+    # machine's own rhythm. Accumulation runs whenever history does (a few KB
+    # an hour); this switch gates the *judgement*, so turning it off silences
+    # the items without throwing away the weeks of buckets that produced them.
+    pulse_enabled: bool = True
+    # The rhythm's own retention, deliberately not retention_days: a weekday
+    # baseline needs five weeks where the metric history needs seven days --
+    # and a week of slack on top, or the oldest same-weekday hour is pruned
+    # an hour before the baseline would have read it.
+    pulse_retention_days: int = 42
+    # Quiet is "below this fraction of the quietest normal hour" (the
+    # baseline's 10th percentile), not below a fixed number -- a busy port
+    # and a sleepy one are judged on their own scale.
+    pulse_quiet_ratio: float = 0.25
+    # How long quiet must hold before it is said out loud.
+    pulse_hold_minutes: int = 30
+    # How late a timer may be before "did not fire" is a fact rather than a
+    # rounding difference.
+    pulse_timer_grace_minutes: int = 15
+
     # --- ui ---
     ui: dict[str, Any] = field(default_factory=dict)
 
@@ -223,6 +244,8 @@ EDITABLE = {
     "notify_smtp_port", "notify_smtp_user", "notify_smtp_password",
     "notify_smtp_from", "notify_smtp_to", "notify_smtp_tls",
     "notify_min_severity", "notify_resolved", "notify_offline",
+    "pulse_enabled", "pulse_retention_days", "pulse_quiet_ratio",
+    "pulse_hold_minutes", "pulse_timer_grace_minutes",
 }
 
 # Text fields with a shape: the validator returns the cleaned value or
@@ -314,6 +337,10 @@ LIMITS: dict[str, tuple[float, float]] = {
     "event_max_per_source": (10, 5000),
     "notify_smtp_port": (1, 65535),
     "auto_update_hour": (0, 23),
+    "pulse_retention_days": (14, 365),
+    "pulse_quiet_ratio": (0.05, 0.9),
+    "pulse_hold_minutes": (10, 240),
+    "pulse_timer_grace_minutes": (1, 1440),
 }
 
 

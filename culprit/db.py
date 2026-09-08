@@ -32,7 +32,7 @@ from typing import Any, Iterable, Sequence
 
 log = logging.getLogger("culprit.db")
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
 
 ROLES = ("viewer", "operator", "admin")
 
@@ -202,6 +202,27 @@ CREATE TABLE IF NOT EXISTS deaths (
 
 CREATE INDEX IF NOT EXISTS idx_deaths_ts ON deaths(died_at);
 
+-- The Pulse's hourly activity buckets: how busy each listener, unit and the
+-- machine's own network was, one row per (node, hour, subject). This is the
+-- only place a machine's *rhythm* is kept -- `samples` is pruned at seven
+-- days by default and holds no per-subject series, and a weekday baseline
+-- needs weeks. Sums rather than an average so any statistic can be derived
+-- later, and `active_n` (samples above the metric's floor) so "busy at this
+-- hour a fifth of the time" is separable from "busy every time".
+CREATE TABLE IF NOT EXISTS pulse (
+    node     TEXT    NOT NULL,
+    ts       INTEGER NOT NULL,   -- hour bucket start, epoch seconds (host-local hour)
+    kind     TEXT    NOT NULL,   -- listener | unit | machine
+    subject  TEXT    NOT NULL,
+    n        INTEGER NOT NULL,   -- samples folded
+    active_n INTEGER NOT NULL,   -- samples above the floor
+    a_sum    REAL, a_max REAL,   -- connections | cpu_percent | recv_bytes_sec
+    b_sum    REAL, b_max REAL,   -- (unused)    | io_bytes_sec | sent_bytes_sec
+    PRIMARY KEY (node, ts, kind, subject)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_pulse_subject ON pulse(node, kind, subject, ts);
+
 -- Dashboard users. Passwords are scrypt-hashed with a per-user salt; the
 -- plaintext never touches the database.
 CREATE TABLE IF NOT EXISTS users (
@@ -230,7 +251,18 @@ CREATE TABLE IF NOT EXISTS agents (
     -- the pin is cleared or the node is explicitly updated again. The ref
     -- is the commit that version resolved to at the time.
     pinned_version   TEXT,
-    pinned_ref       TEXT
+    pinned_ref       TEXT,
+    -- "linux" or "windows", from the agent's own report meta, persisted so
+    -- an offline node still shows what it is and the update path (which
+    -- repository's version feed, which mirror) is chosen right. NULL until
+    -- the first report; a Linux agent older than the platform field is
+    -- treated as linux.
+    platform         TEXT,
+    -- 1 when the operator said this machine is not always on (a desktop
+    -- that sleeps at night): being offline is then expected, so it is not
+    -- counted as a problem, not badged and not notified. The host cannot
+    -- tell a switched-off machine from a dead one; only the operator can.
+    intermittent     INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -257,6 +289,7 @@ class History:
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
         self._last_prune = 0.0
+        self._last_pulse_prune = 0.0
         self.error: str | None = None
         if enabled:
             self._open()
@@ -638,6 +671,85 @@ class History:
                 incident["changes"] = window[:8]
         return incidents
 
+    # -------------------------------------------------------------------- pulse
+    def write_pulse_buckets(self, rows: Sequence[tuple]) -> int:
+        """Store closed hour buckets. INSERT OR REPLACE, not IGNORE: a host
+        restarted mid-hour writes that hour twice, and the second write is
+        the more complete one -- a partial row must not win over the whole."""
+        if not self.ready or not self.recording or not rows:
+            return 0
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return 0
+            try:
+                cursor = conn.executemany(
+                    "INSERT OR REPLACE INTO pulse "
+                    "(node, ts, kind, subject, n, active_n, a_sum, a_max, b_sum, b_max) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                conn.commit()
+                return cursor.rowcount or 0
+            except (sqlite3.Error, ValueError, TypeError) as exc:
+                log.warning("pulse write failed: %s", exc)
+                return 0
+
+    def pulse_at_hours(self, node: str,
+                       hours: Sequence[int]) -> list[dict[str, Any]]:
+        """Every subject's buckets at the given hour starts -- the baseline
+        read. The hour starts are computed by the caller in host-local time
+        (so a DST shift moves the cell rather than smearing it), which keeps
+        this a primary-key lookup of at most a few dozen timestamps."""
+        if not self.ready or not hours:
+            return []
+        marks = ", ".join("?" for _ in hours)
+        return [dict(row) for row in self._query(
+            f"SELECT ts, kind, subject, n, active_n, a_sum, a_max, b_sum, b_max "
+            f"FROM pulse WHERE node = ? AND ts IN ({marks})",
+            (node, *[int(h) for h in hours]))]
+
+    def pulse_rows(self, node: str, kind: str, subject: str,
+                   since: float, until: float | None = None) -> list[dict[str, Any]]:
+        """One subject's buckets over a span, oldest first (the rhythm grid)."""
+        if not self.ready:
+            return []
+        return [dict(row) for row in self._query(
+            "SELECT ts, n, active_n, a_sum, a_max, b_sum, b_max FROM pulse "
+            "WHERE node = ? AND kind = ? AND subject = ? AND ts >= ? AND ts <= ? "
+            "ORDER BY ts", (node, kind, subject, int(since),
+                            int(until if until is not None else time.time())))]
+
+    def pulse_subjects(self, node: str) -> list[dict[str, Any]]:
+        """What this node has a rhythm for, with how much of one."""
+        if not self.ready:
+            return []
+        return [dict(row) for row in self._query(
+            "SELECT kind, subject, COUNT(*) AS buckets, MIN(ts) AS oldest, "
+            "MAX(ts) AS newest FROM pulse WHERE node = ? "
+            "GROUP BY kind, subject ORDER BY kind, subject", (node,))]
+
+    def pulse_span(self, node: str) -> dict[str, Any]:
+        """Oldest and newest bucket for one node: how many days of rhythm it
+        has, which is what the Pulse quotes while it is still learning."""
+        if not self.ready:
+            return {"oldest": None, "newest": None, "buckets": 0}
+        rows = self._query(
+            "SELECT MIN(ts) AS oldest, MAX(ts) AS newest, COUNT(*) AS buckets "
+            "FROM pulse WHERE node = ?", (node,))
+        return dict(rows[0]) if rows else {"oldest": None, "newest": None, "buckets": 0}
+
+    def prune_pulse(self, retention_days: int) -> None:
+        """Drop rhythm buckets past their own retention. Separate from
+        prune(): the rhythm needs weeks where the metric history needs days,
+        so the two are not one number."""
+        if not self.ready:
+            return
+        now = time.time()
+        if now - self._last_pulse_prune < 3600:
+            return
+        self._last_pulse_prune = now
+        self._execute("DELETE FROM pulse WHERE ts < ?",
+                      (now - max(1, int(retention_days)) * 86_400,))
+
     # ------------------------------------------------------------------ changes
     def write_changes(self, events: Iterable[dict[str, Any]],
                       node: str = LOCAL_NODE) -> int:
@@ -898,7 +1010,7 @@ class History:
             return {"available": False, "reason": self.error or "history disabled"}
         counts: dict[str, Any] = {}
         for table in ("samples", "proc_samples", "events", "findings", "actions",
-                      "deaths"):
+                      "deaths", "pulse"):
             rows = self._query(f"SELECT COUNT(*) AS n FROM {table}")
             counts[table] = rows[0]["n"] if rows else 0
         span = self._query("SELECT MIN(ts) AS oldest, MAX(ts) AS newest FROM samples")
@@ -1075,7 +1187,19 @@ class History:
     def list_agents(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._query(
             "SELECT name, enabled, created_at, last_seen, last_addr, "
-            "last_auto_update, pinned_version, pinned_ref FROM agents ORDER BY name")]
+            "last_auto_update, pinned_version, pinned_ref, platform, intermittent "
+            "FROM agents ORDER BY name")]
+
+    def set_agent_intermittent(self, name: str, intermittent: bool) -> bool:
+        """The operator's word that this machine is not always on. Returns
+        whether the row exists."""
+        return self._execute("UPDATE agents SET intermittent = ? WHERE name = ?",
+                             (1 if intermittent else 0, name)) > 0
+
+    def set_agent_platform(self, name: str, platform: str | None) -> bool:
+        """Remember which agent this is (linux / windows), from its report."""
+        return self._execute("UPDATE agents SET platform = ? WHERE name = ?",
+                             (platform, name)) > 0
 
     def set_agent_pin(self, name: str, version: str | None, ref: str | None) -> bool:
         """Pin an agent to a version (an operator moved it there on purpose)
@@ -1172,7 +1296,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         except sqlite3.Error:
             pass  # column already there (partial earlier migration)
         # v7: the version pin (an operator's explicit downgrade).
-        for column in ("pinned_version TEXT", "pinned_ref TEXT"):
+        # v8: the agent's platform.
+        # v9: the operator's word that the machine is not always on.
+        # v10: the Pulse's hourly activity buckets (a new table only).
+        for column in ("pinned_version TEXT", "pinned_ref TEXT", "platform TEXT",
+                       "intermittent INTEGER NOT NULL DEFAULT 0"):
             try:
                 conn.execute(f"ALTER TABLE agents ADD COLUMN {column}")
             except sqlite3.Error:
