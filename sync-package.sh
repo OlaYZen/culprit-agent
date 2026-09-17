@@ -23,7 +23,7 @@ if [ ! -d "$src/collectors" ] || [ ! -f "$src/sampler.py" ]; then
 fi
 
 rsync -a --delete \
-  --exclude='main.py' --exclude='auth.py' --exclude='nodes.py' \
+  --exclude='main.py' --exclude='auth.py' --exclude='nodes.py' --exclude='oidc.py' \
   --exclude='__main__.py' --exclude='agent.py' --exclude='updater.py' \
   --exclude='expect.py' --exclude='notify.py' --exclude='verdict.py' \
   --exclude='coroner.py' --exclude='fleetmap.py' --exclude='portnames.py' --exclude='changelog.py'  \
